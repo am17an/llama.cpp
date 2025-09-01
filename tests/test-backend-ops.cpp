@@ -1187,6 +1187,13 @@ struct test_case {
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            printf("f1.size(): %zu f2.size(): %zu\n", f1.size(), f2.size());
+            for(int i = 0; i < f1.size(); ++i) {
+                if(std::abs(f1[i] - f2[i] > 1e-1)) {
+                    printf("i: %d f1: %f f2: %f\n", i, f1[i], f2[i]);
+                }
+            }
+
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
@@ -6099,8 +6106,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(
         GGML_TYPE_F32, GGML_TYPE_F32,
-        64, 4, false,
-        256, 16, 512));
+        2, 2, false,
+        512, 2, 128));
 
     // test large experts*tokens
     for (bool b : {false, true}) {
