@@ -26,6 +26,18 @@ static __global__ void mul_mat_f(
     constexpr int ntB = (cols_per_block + tile_B::I - 1) / tile_B::I;
 
     const int row0        = blockIdx.x * rows_per_block;
+
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        if(threadIdx.x == 0 && threadIdx.y == 0) {
+
+            for(int i = 0; i < n_tokens; i++) {
+                for(int j = 0; j < n_expert_used; ++j) {
+                    printf("ids, token: %d, expert %d: %d\n", i, j, ids[i*n_experts + j]);
+                }
+
+            }
+        }
+    }
     
     // For mul_mat_id: extract expert and channel indices from blockIdx.y
     // blockIdx.y ranges from 0 to (n_experts * n_expert_used - 1)
@@ -136,19 +148,20 @@ static __global__ void mul_mat_f(
             sum += buf_iw[j*kiw + i];
         }
         // For mul_mat_id: only write if this expert is selected for this token
-        // ids is [n_expert_used, n_tokens], access: ids[channel_dst * n_tokens + sample_dst]  
+        // ids is [n_expert_used, n_tokens], but row stride equals n_experts (original width)
+        // access: ids[j * n_experts + channel_dst]
         if (!ids) {
             dst[j*stride_col_dst + row0 + threadIdx.x] = sum;
         } else {
-            const int32_t expected_expert = ids[channel_dst * n_tokens + j];
+            const int32_t expected_expert = ids[j * n_experts + channel_dst];
             const bool should_write = expected_expert == expert_idx;
-            
-            // Debug: print expected vs actual expert indices
-            if (should_write) {
-                /*
-                printf("pos=%d: channel_dst=%d, sample_dst=%d, expected_expert=%d, expert_idx=%d, should_write=%d\n", 
-                    j*stride_channel_dst + row0 + threadIdx.x, channel_dst, sample_dst, expected_expert, expert_idx, should_write);
-                */
+
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0 && (j < 2)) {
+                printf("[mmf] dbg: BY=%d used=%d token_j=%d expert_idx=%d expected=%d should=%d dst_off=%lld y_off=%lld x_off=%lld\n",
+                    (int)blockIdx.y, channel_dst, j, expert_idx, expected_expert, (int)should_write,
+                    (long long)(channel_dst*stride_channel_dst + j*stride_col_dst + row0),
+                    (long long)(channel_y*stride_channel_y + j*stride_col_y),
+                    (long long)(channel_x*stride_channel_x + row0*stride_row));
             }
             
             if (should_write) {
@@ -418,10 +431,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int64_t ncols_dst          = ids ? ne2  : ne1;          // n_tokens : ne1
     const int64_t nchannels_y        = ids ? ne11 : ne12;         // n_expert_used : ne12  
     const int64_t nchannels_dst      = ids ? ne11 : ne2;          // n_expert_used : ne2
-    const int64_t stride_channel_dst = ids ? s1 * ncols_dst : s2;           // stride for n_expert_used : s2 
-    const int64_t stride_channel_y   = ids ? s11 * ncols_dst  : s12;          // stride for n_expert_used : s12
-    //const int64_t stride_channel_y   = s12; // stride for n_expert_used : s12
-
+    // column (N) stride for dst and y
+    const int64_t stride_col_dst     = ids ? s2   : s1;           // tokens stride when ids, else regular
+    const int64_t stride_col_y_raw   = ids ? s12  : s11;          // tokens stride in src1 when ids, else used stride
+    // channel (used) stride for dst and y
+    const int64_t stride_channel_dst = ids ? s1   : s2;           // used stride when ids, else regular
+    const int64_t stride_channel_y   = ids ? s11  : s12;          // used stride in src1 when ids, else tokens stride
 
     // For MUL_MAT_ID, ncols_dst is n_tokens, not necessarily 1
     // GGML_ASSERT(!ids || ncols_dst == 1);
@@ -430,24 +445,27 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
             constexpr int vals_per_T = 1;
+            const int64_t stride_col_y = stride_col_y_raw / vals_per_T;
             mul_mat_f_switch_cols_per_block(
-                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, s11/vals_per_T, s1,
+                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
                 ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half2 * src0_d = (const half2 *) src0->data;
             constexpr int vals_per_T = 2;
+            const int64_t stride_col_y = stride_col_y_raw / vals_per_T;
             mul_mat_f_switch_cols_per_block(
-                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, s11/vals_per_T, s1,
+                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
                 ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
             constexpr int vals_per_T = 2;
+            const int64_t stride_col_y = stride_col_y_raw / vals_per_T;
             mul_mat_f_switch_cols_per_block(
-                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, s11/vals_per_T, s1,
+                src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
                 ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
         } break;

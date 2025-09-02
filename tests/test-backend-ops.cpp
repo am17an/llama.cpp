@@ -6106,8 +6106,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(
         GGML_TYPE_F32, GGML_TYPE_F32,
-        2, 2, false,
-        512, 2, 128));
+        8, 4, false,
+        512, 16, 128));
 
     // test large experts*tokens
     for (bool b : {false, true}) {
