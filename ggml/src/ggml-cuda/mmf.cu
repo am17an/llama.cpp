@@ -7,6 +7,17 @@ using namespace ggml_cuda_mma;
 
 #define MMF_ROWS_PER_BLOCK 32
 
+static __global__ void mmf_ids_helper(const int32_t *__restrict__ ids
+    , int32_t * token_per_expert
+    , const int stride_id_col, const int stride_id_row, const int ncols_id, const int nrows_id, const int n_experts) {
+
+    const int token = threadIdx.y;
+
+    for(int i = threadIdx.x; i < ncols_id; i += blockDim.x) {
+        const int expert_used = ids[stride_id_row * token + i*stride_id_col];
+        atomicAdd(&token_per_expert[expert_used], 1);
+    }
+}
 template <typename T, int rows_per_block, int cols_per_block, int nwarps>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
@@ -14,11 +25,17 @@ static __global__ void mul_mat_f(
         const int ncols, const int nchannels_y, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int n_experts, const int n_expert_used, const int n_tokens) {
+        const int n_experts, const int n_expert_used, const int n_tokens, 
+        const int * tokens_per_expert) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     typedef tile<16, 8, T>     tile_A;
     typedef tile< 8, 8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
+
+    const int expert_idx  = ids ? (blockIdx.y % n_experts) : 0;
+    if (tokens_per_expert[expert_idx] == 0) {
+        return;
+    }
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int tile_k_padded = warp_size + 4;
@@ -27,22 +44,7 @@ static __global__ void mul_mat_f(
 
     const int row0        = blockIdx.x * rows_per_block;
 
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-        if(threadIdx.x == 0 && threadIdx.y == 0) {
-
-            for(int i = 0; i < n_tokens; i++) {
-                for(int j = 0; j < n_expert_used; ++j) {
-                    printf("ids, token: %d, expert %d: %d\n", i, j, ids[i*n_experts + j]);
-                }
-
-            }
-        }
-    }
-    
-    // For mul_mat_id: extract expert and channel indices from blockIdx.y
-    // blockIdx.y ranges from 0 to (n_experts * n_expert_used - 1)
-    const int expert_idx  = ids ? (blockIdx.y % n_experts) : 0;        // Which expert (0 to n_experts-1)
-    const int channel_dst = ids ? (blockIdx.y / n_experts) : blockIdx.y; // Which expert_used slot (0 to n_expert_used-1)
+    const int channel_dst = ids ? (blockIdx.y / n_experts) : blockIdx.y;
 
     const int channel_x   = ids ? expert_idx : (channel_dst / channel_ratio);
     const int channel_y   = channel_dst;
@@ -153,17 +155,10 @@ static __global__ void mul_mat_f(
         if (!ids) {
             dst[j*stride_col_dst + row0 + threadIdx.x] = sum;
         } else {
+            //TODO: fix with stride_id_row instead of n_experts
             const int32_t expected_expert = ids[j * n_experts + channel_dst];
             const bool should_write = expected_expert == expert_idx;
 
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0 && (j < 2)) {
-                printf("[mmf] dbg: BY=%d used=%d token_j=%d expert_idx=%d expected=%d should=%d dst_off=%lld y_off=%lld x_off=%lld\n",
-                    (int)blockIdx.y, channel_dst, j, expert_idx, expected_expert, (int)should_write,
-                    (long long)(channel_dst*stride_channel_dst + j*stride_col_dst + row0),
-                    (long long)(channel_y*stride_channel_y + j*stride_col_y),
-                    (long long)(channel_x*stride_channel_x + row0*stride_row));
-            }
-            
             if (should_write) {
                 dst[j*stride_col_dst + row0 + threadIdx.x] = sum;
             }
@@ -187,6 +182,7 @@ static void mul_mat_f_cuda(
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int32_t * tokens_per_expert,
         cudaStream_t stream) {
     typedef tile<16, 8, T>     tile_A;
     typedef tile< 8, 8, T>     tile_B;
@@ -219,16 +215,9 @@ static void mul_mat_f_cuda(
     const int nbytes_shared_combine = GGML_PAD(cols_per_block, tile_B::I) * (nwarps_best*rows_per_block + 4) * 4;
     const int nbytes_shared = std::max(nbytes_shared_iter, nbytes_shared_combine);
     const int64_t grid_y = ids ? nchannels_dst * nchannels_x : nchannels_dst;  // For mul_mat_id: n_expert_used * n_experts
-    
+
     const dim3 block_nums(nrows_x/rows_per_block, grid_y, nsamples_dst);
     const dim3 block_dims(warp_size, nwarps_best, 1);
-
-    //print everything here all the arguments, 
-    printf("x: %p, y: %p, ids: %p, dst: %p, ncols_x: %lld, nrows_x: %lld, ncols_dst: %lld, stride_row: %lld, stride_col_y: %lld, stride_col_dst: %lld, nchannels_x: %lld, nchannels_y: %lld, nchannels_dst: %lld, stride_channel_x: %lld, stride_channel_y: %lld, stride_channel_dst: %lld, nsamples_x: %lld, nsamples_dst: %lld, stride_sample_x: %lld, stride_sample_y: %lld, stride_sample_dst: %lld, nwarps_best: %lld\n",
-        x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, nwarps_best);
-
-    printf("block_nums: %lld, %lld, %lld\n", block_nums.x, block_nums.y, block_nums.z);
-    printf("block_dims: %d, %d, %d\n", block_dims.x, block_dims.y, block_dims.z);
 
     switch (nwarps_best) {
         case 1: {
@@ -236,56 +225,56 @@ static void mul_mat_f_cuda(
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 2: {
             mul_mat_f<T, rows_per_block, cols_per_block, 2><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 3: {
             mul_mat_f<T, rows_per_block, cols_per_block, 3><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 4: {
             mul_mat_f<T, rows_per_block, cols_per_block, 4><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 5: {
             mul_mat_f<T, rows_per_block, cols_per_block, 5><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 6: {
             mul_mat_f<T, rows_per_block, cols_per_block, 6><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 7: {
             mul_mat_f<T, rows_per_block, cols_per_block, 7><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         case 8: {
             mul_mat_f<T, rows_per_block, cols_per_block, 8><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, dst, ncols_x, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 nchannels_x, nchannels_dst, ncols_dst);
+                 nchannels_x, nchannels_dst, ncols_dst, tokens_per_expert);
         } break;
         default: {
             GGML_ABORT("fatal error");
@@ -301,87 +290,88 @@ static void mul_mat_f_switch_cols_per_block(
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int32_t * tokens_per_expert,
         cudaStream_t stream) {
     switch (ncols_dst) {
         case  1: {
             mul_mat_f_cuda<T,  1>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case  2: {
             mul_mat_f_cuda<T,  2>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  3: {
             mul_mat_f_cuda<T,  3>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  4: {
             mul_mat_f_cuda<T,  4>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case  5: {
             mul_mat_f_cuda<T,  5>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  6: {
             mul_mat_f_cuda<T,  6>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  7: {
             mul_mat_f_cuda<T,  7>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  8: {
             mul_mat_f_cuda<T,  8>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case  9: {
             mul_mat_f_cuda<T,  9>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case 10: {
             mul_mat_f_cuda<T, 10>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  tokens_per_expert, stream);
         } break;
         case 11: {
             mul_mat_f_cuda<T, 11>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case 12: {
             mul_mat_f_cuda<T, 12>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case 13: {
             mul_mat_f_cuda<T, 13>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case 14: {
             mul_mat_f_cuda<T, 14>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case 15: {
             mul_mat_f_cuda<T, 15>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         case 16: {
             mul_mat_f_cuda<T, 16>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst,  stream);
+                nsamples_x,                nsamples_dst,  stride_sample_x,  stride_sample_y,  stride_sample_dst, tokens_per_expert, stream);
         } break;
         default: {
             GGML_ABORT("fatal error");
@@ -412,11 +402,6 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
-    // For MUL_MAT_ID: initialize destination to zero to handle sparse writes
-    if (ids != nullptr) {
-        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), ctx.stream()));
-    }
-
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -428,19 +413,40 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;          // n_tokens : ne1
-    const int64_t nchannels_y        = ids ? ne11 : ne12;         // n_expert_used : ne12  
-    const int64_t nchannels_dst      = ids ? ne11 : ne2;          // n_expert_used : ne2
-    // column (N) stride for dst and y
-    const int64_t stride_col_dst     = ids ? s2   : s1;           // tokens stride when ids, else regular
-    const int64_t stride_col_y_raw   = ids ? s12  : s11;          // tokens stride in src1 when ids, else used stride
-    // channel (used) stride for dst and y
-    const int64_t stride_channel_dst = ids ? s1   : s2;           // used stride when ids, else regular
-    const int64_t stride_channel_y   = ids ? s11  : s12;          // used stride in src1 when ids, else tokens stride
+    const int64_t ncols_dst         = ids ? ne2  : ne1;
+    int64_t nchannels_y             = ids ? ne11 : ne12;
+    const  int64_t nchannels_dst    = ids ? ne1 : ne2;
 
-    // For MUL_MAT_ID, ncols_dst is n_tokens, not necessarily 1
-    // GGML_ASSERT(!ids || ncols_dst == 1);
-   
+    const int64_t stride_col_dst     = ids ? s2   : s1;
+    const int64_t stride_col_y_raw   = ids ? s12  : s11;
+    const int64_t stride_channel_dst = ids ? s1 : s2;
+    int64_t stride_channel_y   = ids ? s11  : s12;
+
+    if (ids && nchannels_y == 1) {
+        nchannels_y= ids->ne[0];
+        stride_channel_y = 0;
+    }
+
+    //helper to collect id per expert
+    const int32_t * tokens_per_expert_dev_ptr = nullptr ;
+    if (ids) {
+        ggml_cuda_pool_alloc<int32_t> tokens_per_expert_dev(ctx.pool(), ne03);
+        dim3 blocks(1, 1, 1);
+        dim3 block_dim(WARP_SIZE, ne2, 1);
+
+        mmf_ids_helper<<<blocks, block_dim>>>(
+            (const int32_t*)ids->data,
+            tokens_per_expert_dev.ptr,
+            ids->nb[0]/sizeof(int32_t), 
+            ids->nb[1]/sizeof(int32_t),
+            ids->ne[0],
+            ids->ne[1],
+            ne03
+        );
+
+        tokens_per_expert_dev_ptr = tokens_per_expert_dev.ptr;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
@@ -449,7 +455,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_cols_per_block(
                 src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
+                ne03, ne3, s03/vals_per_T, s13, s3, tokens_per_expert_dev_ptr, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half2 * src0_d = (const half2 *) src0->data;
@@ -458,7 +464,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_cols_per_block(
                 src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
+                ne03, ne3, s03/vals_per_T, s13, s3, tokens_per_expert_dev_ptr,  ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
@@ -467,7 +473,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_cols_per_block(
                 src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream());
+                ne03, ne3, s03/vals_per_T, s13, s3, tokens_per_expert_dev_ptr, ctx.stream());
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
