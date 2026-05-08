@@ -5461,6 +5461,9 @@ class _Qwen35MtpMixin:
     block_count: int
     tensor_map: gguf.TensorNameMap
 
+    # NEW: Cache for MTP expert tensors
+    _mtp_experts: dict[str, Tensor] | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("mtp_num_hidden_layers", 0)
@@ -5472,6 +5475,7 @@ class _Qwen35MtpMixin:
             self.gguf_writer.add_nextn_predict_layers(n)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+
         # Multimodal Qwen3.5/3.6 wrap the text model under `model.language_model.*`.
         if name.startswith("model.language_model."):
             name = "model." + name[len("model.language_model."):]
@@ -5483,6 +5487,45 @@ class _Qwen35MtpMixin:
         #     mtp.fc / mtp.pre_fc_norm_embedding / mtp.pre_fc_norm_hidden / mtp.norm
         if name.startswith("mtp."):
             n_layer = self.hparams["num_hidden_layers"]
+
+            # NEW: Handle MTP expert tensors - collect and merge them into fused format
+            if name.startswith("mtp.layers.") and ".mlp.experts." in name:
+                if self._mtp_experts is None:
+                    self._mtp_experts = {}
+
+                # Store the tensor
+                self._mtp_experts[name] = data_torch
+
+                # Check if we have all experts (default 512 experts × 3 tensor types = 1536 tensors)
+                n_experts = self.hparams.get("num_experts", 512)
+
+                if len(self._mtp_experts) >= n_experts * 3:
+                    # Merge experts into fused tensors
+                    gate_tensors = []
+                    up_tensors = []
+                    down_tensors = []
+
+                    for xid in range(n_experts):
+                        gate_tensors.append(self._mtp_experts[f"mtp.layers.0.mlp.experts.{xid}.gate_proj.weight"])
+                        up_tensors.append(self._mtp_experts[f"mtp.layers.0.mlp.experts.{xid}.up_proj.weight"])
+                        down_tensors.append(self._mtp_experts[f"mtp.layers.0.mlp.experts.{xid}.down_proj.weight"])
+
+                    # Stack gate and up together (fused), down separately
+                    # gate_up shape: (n_experts, hidden_dim * 2, n_embd)
+                    gate_up = torch.stack([torch.cat([g, u], dim=0) for g, u in zip(gate_tensors, up_tensors)], dim=0)
+                    # down shape: (n_experts, n_embd, hidden_dim)
+                    down = torch.stack(down_tensors, dim=0)
+
+                    # Yield as fused tensors at the MTP layer index
+                    yield from super().modify_tensors(gate_up, f"model.layers.{n_layer}.mlp.experts.gate_up_proj", n_layer)
+                    yield from super().modify_tensors(down, f"model.layers.{n_layer}.mlp.experts.down_proj", n_layer)
+
+                    # Clear the cache
+                    self._mtp_experts = None
+
+                return
+
+            # Existing handling for non-expert MTP tensors
             if name.find("layers.") != -1:
                 assert bid is not None
                 name = name.replace(f"mtp.layers.{bid}", f"model.layers.{bid + n_layer}")
