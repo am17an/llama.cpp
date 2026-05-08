@@ -5496,9 +5496,11 @@ class _Qwen35MtpMixin:
                 # Store the tensor
                 self._mtp_experts[name] = data_torch
 
-                # Check if we have all experts (default 512 experts × 3 tensor types = 1536 tensors)
-                n_experts = self.hparams.get("num_experts", 512)
+                # Check experts number (Qwen 3.5 397B has 512 experts, 35B 256 experts)
+                n_experts = self.hparams.get("num_experts")
 
+                # Any model with fused experts skips this. Ex: Qwen 3.5 35B -> _mtp_experts should only count 3 (< 256 * 3)
+                # This fuses any loose experts in a way that the resto fo the code expects
                 if len(self._mtp_experts) >= n_experts * 3:
                     # Merge experts into fused tensors
                     gate_tensors = []
