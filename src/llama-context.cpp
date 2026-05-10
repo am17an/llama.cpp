@@ -3217,6 +3217,13 @@ void llama_context::handle_mtp_for_ubatch(
     if (n_tokens == 0 || t == nullptr) {
         return;
     }
+    // Skip embed-only ubatches (e.g. image/audio chunks from mtmd): the MTP
+    // head needs token ids paired with hidden states, and we have none here.
+    // pending_pos is left untouched so it self-resets via !pending_continues
+    // when the next text ubatch arrives at a non-adjacent position.
+    if (tokens == nullptr) {
+        return;
+    }
     if (t->ne[1] != (int64_t) n_tokens) {
         return;
     }
