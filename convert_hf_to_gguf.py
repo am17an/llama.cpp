@@ -95,6 +95,7 @@ class ModelBase:
     gguf_writer: gguf.GGUFWriter
     model_name: str | None
     metadata_override: Path | None
+    metadata: gguf.Metadata
     dir_model_card: Path
     remote_hf_model_id: str | None
 
@@ -5559,16 +5560,8 @@ class _Qwen35MtpMixin:
     gguf_writer: gguf.GGUFWriter
     block_count: int
     tensor_map: gguf.TensorNameMap
-    fname_out: Path
-    ftype: Any
-    metadata: Any
 
-    # When true, `--mtp` was passed: filter out trunk weights so the resulting
-    # GGUF carries only the MTP head and the shared embeddings/output tensors.
     mtp_only: bool = False
-
-    # When true, `--no-mtp` was passed: drop `mtp.*` tensors and report block_count
-    # as the trunk-only layer count, producing a GGUF with no MTP head.
     no_mtp: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -5582,10 +5575,19 @@ class _Qwen35MtpMixin:
     def filter_tensors(cls, item):
         name, _ = item
         if name.startswith("mtp."):
-            # Qwen3Next drops `mtp.*` tensors; Qwen3.5/3.6 use them by default. `--no-mtp` opts out.
             if cls.no_mtp:
                 return None
             return item
+        if cls.mtp_only:
+            # In --mtp mode, drop trunk weights and keep only the shared embeddings/output
+            # tensors that the standalone MTP graph references at inference time.
+            canonical = name.replace("language_model.", "")
+            keep = canonical in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                "embed_tokens.weight", "norm.weight",
+            )
+            if not keep:
+                return None
         return super().filter_tensors(item)  # ty: ignore[unresolved-attribute]
 
     def set_gguf_parameters(self):
@@ -5601,38 +5603,19 @@ class _Qwen35MtpMixin:
         if not self.mtp_only:
             return
 
-        output_type: str = self.ftype.name.partition("_")[2]
+        output_type: str = self.ftype.name.partition("_")[2]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
 
         if self.fname_out.is_dir():
             fname_default: str = gguf.naming_convention(
-                self.metadata.name, self.metadata.basename, self.metadata.finetune,
-                self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+                self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+                self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
             self.fname_out = self.fname_out / f"{Path(fname_default).stem}-MTP.gguf"
         else:
             stem = self.fname_out.stem
             self.fname_out = self.fname_out.parent / f"{stem}-MTP{self.fname_out.suffix}"
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Multimodal Qwen3.5/3.6 wrap the text model under `model.language_model.*`.
-        if name.startswith("model.language_model."):
-            name = "model." + name[len("model.language_model."):]
-        elif name.startswith("language_model."):
-            name = name[len("language_model."):]
-
-        if self.mtp_only:
-            # In --mtp mode keep only the MTP block plus the shared embedding/output tensors
-            # that the standalone MTP graph references at inference time.
-            keep = (
-                name.startswith("mtp.") or
-                name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight") or
-                name in ("embed_tokens.weight", "norm.weight")
-            )
-            if not keep:
-                return
-
         # Remap MTP block tensors to llama.cpp's layer-indexed nextn naming.
-        # HF: mtp.layers.0.*  (transformer block at MTP slot 0)
-        #     mtp.fc / mtp.pre_fc_norm_embedding / mtp.pre_fc_norm_hidden / mtp.norm
         if name.startswith("mtp."):
             n_layer = self.hparams["num_hidden_layers"]
             if name.find("layers.") != -1:
@@ -14262,9 +14245,11 @@ def main() -> None:
             logger.error("--mtp / --no-mtp are only supported for Qwen3.5/3.6 text variants today")
             sys.exit(1)
 
-        # set on the class so __init__ sees the correct mode when computing block_count
+        # set on the class so __init__ / filter_tensors see the correct mode
         if args.no_mtp:
             model_class.no_mtp = True
+        if args.mtp:
+            model_class.mtp_only = True
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
@@ -14277,9 +14262,6 @@ def main() -> None:
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps
                                      )
-
-        if args.mtp:
-            model_instance.mtp_only = True
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
