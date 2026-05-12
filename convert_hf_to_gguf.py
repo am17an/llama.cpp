@@ -5463,6 +5463,31 @@ class _Qwen35MtpMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Upstream Qwen3.6 repos (Qwen/Qwen3.6-27B, Qwen/Qwen3.6-35B-A3B) ship
+        # MTP weights under `mtp.*` but do not set `mtp_num_hidden_layers` in
+        # config.json. Without this hparam the mixin silently drops the entire
+        # MTP block at conversion time, producing a GGUF that fails to load
+        # later with `GGML_ASSERT(nextn_predict_layers > 0)` when `--spec-type
+        # mtp` is requested. Infer it from the safetensors weight map so the
+        # converter works on un-patched HF repos.
+        if not self.hparams.get("mtp_num_hidden_layers"):
+            wm_keys: Iterable[str] = ()
+            idx = self.dir_model / "model.safetensors.index.json"
+            if idx.is_file():
+                wm_keys = json.loads(idx.read_text()).get("weight_map", {}).keys()
+            else:
+                sf = self.dir_model / "model.safetensors"
+                if sf.is_file():
+                    with open(sf, "rb") as _f:
+                        _n = int.from_bytes(_f.read(8), "little")
+                        wm_keys = json.loads(_f.read(_n).decode("utf-8")).keys()
+            ids = {int(m.group(1)) for k in wm_keys for m in [re.match(r"mtp\.layers\.(\d+)\.", k)] if m}
+            if ids:
+                self.hparams["mtp_num_hidden_layers"] = max(ids) + 1
+                logger.warning(
+                    f"inferred mtp_num_hidden_layers={self.hparams['mtp_num_hidden_layers']} "
+                    f"from safetensors weight_map (HF config.json missing this key)."
+                )
         self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("mtp_num_hidden_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
