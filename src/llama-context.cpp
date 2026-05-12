@@ -290,7 +290,7 @@ llama_context::llama_context(
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
-            /*.ctx_type=*/  cparams.ctx_type,
+            /*.ctx_type= */ cparams.ctx_type,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3397,8 +3397,9 @@ llama_context * llama_init_from_model(
                        model->hparams.pooling_type, params.pooling_type);
     }
 
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model->hparams.nextn_predict_layers == 0) {
-        LLAMA_LOG_WARN("%s: context type MTP request but model doesn't contain MTP layers\n", __func__);
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        model->hparams.nextn_predict_layers == 0) {
+        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }
 
