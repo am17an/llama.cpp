@@ -566,7 +566,7 @@ static hf_cache::hf_files get_split_files(const hf_cache::hf_files & files,
     return result;
 }
 
-// pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "MTP"),
+// pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "mtp"),
 // preferring deeper shared directory prefix with the model, then closest quantization
 static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
                                            const std::string        & model,
@@ -616,7 +616,7 @@ static hf_cache::hf_file find_best_mmproj(const hf_cache::hf_files & files,
 
 static hf_cache::hf_file find_best_mtp(const hf_cache::hf_files & files,
                                        const std::string        & model) {
-    return find_best_sibling(files, model, "MTP");
+    return find_best_sibling(files, model, "mtp-");
 }
 
 static bool gguf_filename_is_model(const std::string & filepath) {
@@ -631,7 +631,7 @@ static bool gguf_filename_is_model(const std::string & filepath) {
 
     return filename.find("mmproj")  == std::string::npos &&
            filename.find("imatrix") == std::string::npos &&
-           filename.find("MTP")     == std::string::npos;
+           filename.find("mtp-")    == std::string::npos;
 }
 
 static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
