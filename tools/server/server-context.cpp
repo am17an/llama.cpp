@@ -761,7 +761,7 @@ private:
                                             params_base.speculative.types.end(),
                                             COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
-                cparams.graph_type = LLAMA_GRAPH_TYPE_DECODER_MTP;
+                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
@@ -784,7 +784,7 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.graph_type = LLAMA_GRAPH_TYPE_DECODER_MTP;
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {

@@ -268,8 +268,6 @@ private:
 
     llama_cparams cparams;
 
-    llm_graph_type gtype = LLM_GRAPH_TYPE_DECODER;
-
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 

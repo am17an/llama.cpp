@@ -1946,7 +1946,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // The MTP head is dense-attention only on hybrid Qwen3.5/3.6, so use a plain
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen35 =
-                    params.gtype == LLM_GRAPH_TYPE_DECODER_MTP &&
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
                 if (llm_arch_is_recurrent(arch)) {
