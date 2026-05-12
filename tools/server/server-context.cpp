@@ -772,14 +772,6 @@ private:
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
         } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                              COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end()) {
-            // MTP head lives in the *target* model — share the same llama_model and
-            // spin up a second context that builds the MTP graph instead of the trunk graph.
-            if (!llama_model_has_mtp(model_tgt)) {
-                SRV_ERR("MTP requested but the target model '%s' has no MTP tensors\n",
-                        params_base.model.path.c_str());
-                return false;
-            }
-
             SRV_INF("creating MTP draft context against the target model '%s'\n",
                     params_base.model.path.c_str());
 
