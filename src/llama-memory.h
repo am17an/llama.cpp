@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-graph.h"
 
 #include <map>
 #include <memory>
@@ -20,6 +21,8 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    llm_graph_type gtype;
 };
 
 enum llama_memory_status {

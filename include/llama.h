@@ -198,6 +198,13 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    enum llama_graph_type {
+        LLAMA_GRAPH_TYPE_DEFAULT     = 0,
+        LLAMA_GRAPH_TYPE_ENCODER     = 1,
+        LLAMA_GRAPH_TYPE_DECODER     = 2,
+        LLAMA_GRAPH_TYPE_DECODER_MTP = 3,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -383,6 +390,8 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        enum llama_graph_type graph_type;
     };
 
     struct llama_model_tensor_override {
@@ -556,6 +565,8 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
+
+    LLAMA_API bool    llama_model_has_mtp    (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);

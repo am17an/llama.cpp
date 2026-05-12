@@ -66,6 +66,14 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    switch (params.graph_type) {
+        case LLAMA_GRAPH_TYPE_DEFAULT:     gtype = LLM_GRAPH_TYPE_DEFAULT;     break;
+        case LLAMA_GRAPH_TYPE_ENCODER:     gtype = LLM_GRAPH_TYPE_ENCODER;     break;
+        case LLAMA_GRAPH_TYPE_DECODER:     gtype = LLM_GRAPH_TYPE_DECODER;     break;
+        case LLAMA_GRAPH_TYPE_DECODER_MTP: gtype = LLM_GRAPH_TYPE_DECODER_MTP; break;
+        default: throw std::runtime_error("invalid graph_type");
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -279,6 +287,7 @@ llama_context::llama_context(
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
+            /*.gtype    =*/ gtype,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1738,7 +1747,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2198,7 +2207,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     res->reset();
 
@@ -3177,7 +3186,7 @@ void llama_context::opt_epoch_iter(
 
             auto * res = gf_res_prev.get();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+            const auto gparams = graph_params(res, ubatch, mctx.get(), gtype);
 
             res->reset();
 
@@ -3306,6 +3315,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.graph_type                  =*/ LLAMA_GRAPH_TYPE_DEFAULT,
     };
 
     return result;
