@@ -14247,9 +14247,9 @@ def main() -> None:
 
         # set on the class so __init__ / filter_tensors see the correct mode
         if args.no_mtp:
-            model_class.no_mtp = True
+            model_class.no_mtp = True  # ty: ignore[unresolved-attribute]
         if args.mtp:
-            model_class.mtp_only = True
+            model_class.mtp_only = True  # ty: ignore[unresolved-attribute]
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
