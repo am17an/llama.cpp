@@ -5598,21 +5598,19 @@ class _Qwen35MtpMixin:
             self.gguf_writer.add_nextn_predict_layers(n)
 
     def prepare_metadata(self, vocab_only: bool):
+        # TextModel.prepare_metadata resolves a directory fname_out into a concrete
+        # file path, so snapshot is_dir() first to decide whether to apply the mtp- prefix.
+        from_dir = self.fname_out.is_dir()
         super().prepare_metadata(vocab_only=vocab_only)  # ty: ignore[unresolved-attribute]
 
-        if not self.mtp_only:
+        if not self.mtp_only or not from_dir:
             return
 
         output_type: str = self.ftype.name.partition("_")[2]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
-
-        if self.fname_out.is_dir():
-            fname_default: str = gguf.naming_convention(
-                self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
-                self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
-            self.fname_out = self.fname_out / f"{Path(fname_default).stem}-MTP.gguf"
-        else:
-            stem = self.fname_out.stem
-            self.fname_out = self.fname_out.parent / f"{stem}-MTP{self.fname_out.suffix}"
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Remap MTP block tensors to llama.cpp's layer-indexed nextn naming.
