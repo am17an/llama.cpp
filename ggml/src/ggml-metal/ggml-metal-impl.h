@@ -879,6 +879,7 @@ typedef struct {
     int32_t  ns02;
     int32_t  ns12;
     int32_t  ns22;
+    int32_t  n_state_slots;
     int32_t  ne0;
     int32_t  ne1;
     int32_t  ne2;

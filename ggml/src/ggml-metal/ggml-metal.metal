@@ -2531,7 +2531,6 @@ kernel void kernel_rwkv_wkv7_f32(
 
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
-constant short FC_gated_delta_net_K     [[function_constant(FC_GATED_DELTA_NET + 2)]];
 
 #if 1
 template<short NSG>
@@ -2562,12 +2561,9 @@ kernel void kernel_gated_delta_net_impl(
 
     const float scale = 1.0f / sqrt((float)S_v);
 
-    const uint K = FC_gated_delta_net_K;
-
-    // input state layout (D, K, n_seqs): per-seq stride is K*H*D; we read slot 0.
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
-    const uint state_in_base = (i23*K*args.ne21 + i21)*S_v*S_v + i20*S_v;
-    device const float * s_ptr = (device const float *) (s) + state_in_base;
+    // input state layout is (D, K, n_seqs); only slot 0 is read.
+    device const float * s_ptr = (device const float *) (s) + (i23*args.n_state_slots*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
     float ls[NSG];
 
@@ -2585,16 +2581,10 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
-    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K, only the last
-    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
-    const int shift = (int)args.ne22 - (int)K;
-
-    // output state base offset: after attention scores
-    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
-    // output state per-slot size: S_v * S_v * H * n_seqs
-    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
-    // per-(seq,head) offset within a slot
-    const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    device float * dst_state_base = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v;
+    const int state_size_per_snap = S_v*S_v*args.ne21*args.ne23;
+    const int state_out_offset = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    const int shift = args.ne22 - args.n_state_slots;
 
     for (short t = 0; t < args.ne22; t++) {
         float s_k = 0.0f;
@@ -2637,27 +2627,27 @@ kernel void kernel_gated_delta_net_impl(
             dst_attn[t*args.ne21*S_v] = y*scale;
         }
 
+        if (args.n_state_slots > 1) {
+            const int target_slot = (int)t - shift;
+            if (target_slot >= 0 && target_slot < args.n_state_slots) {
+                device float * curr_state = dst_state_base + target_slot*state_size_per_snap + state_out_offset;
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    const short is = tx*NSG + j;
+                    curr_state[is] = ls[j];
+                }
+            }
+        }
+
         q_ptr += args.ns02;
         k_ptr += args.ns12;
         v_ptr += args.ns22;
 
         b_ptr += args.ne21;
         g_ptr += args.ne21*G;
-
-        if (K > 1u) {
-            const int target_slot = (int)t - shift;
-            if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
-                    dst_state[is] = ls[j];
-                }
-            }
-        }
     }
 
-    if (K == 1u) {
-        device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
+    if (args.n_state_slots == 1) {
+        device float * dst_state = dst_state_base + state_out_offset;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];
@@ -2706,7 +2696,7 @@ kernel void kernel_gated_delta_net_impl(
 
     const float scale = 1.0f / sqrt((float)S_v);
 
-    device const float * s_ptr = (device const float *) (s) + (i23*args.ne21 + i21)*S_v*S_v + i20;
+    device const float * s_ptr = (device const float *) (s) + (i23*args.n_state_slots*args.ne21 + i21)*S_v*S_v + i20;
 
     float lsf[NSG];
 
@@ -2725,6 +2715,11 @@ kernel void kernel_gated_delta_net_impl(
 
     device const float * b_ptr  = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr  = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
+
+    device float * dst_state_base = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v;
+    const int state_size_per_snap = S_v*S_v*args.ne21*args.ne23;
+    const int state_out_offset = (i23*args.ne21 + i21)*S_v*S_v + i20;
+    const int shift = args.ne22 - args.n_state_slots;
 
     for (short t = 0; t < args.ne22; t++) {
         device const T * qt_ptr = (device const T *) (q_ptr);
@@ -2750,6 +2745,17 @@ kernel void kernel_gated_delta_net_impl(
             *dst_attn = y*scale;
         }
 
+        if (args.n_state_slots > 1) {
+            const int target_slot = (int)t - shift;
+            if (target_slot >= 0 && target_slot < args.n_state_slots) {
+                device float * curr_state = dst_state_base + target_slot*state_size_per_snap + state_out_offset;
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    const short is = tx*NSG + j;
+                    curr_state[is*S_v] = lsf[j];
+                }
+            }
+        }
+
         q_ptr += args.ns02;
         k_ptr += args.ns12;
         v_ptr += args.ns22;
@@ -2760,12 +2766,12 @@ kernel void kernel_gated_delta_net_impl(
         dst_attn += args.ne21*S_v;
     }
 
-    device float * dst_state  = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20;
-    device T     * dstt_state = (device T     *) (dst_state);
-
-    FOR_UNROLL (short j = 0; j < NSG; j++) {
-        const short is = tx*NSG + j;
-        dst_state[is*S_v] = lsf[j];
+    if (args.n_state_slots == 1) {
+        device float * dst_state = dst_state_base + state_out_offset;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            const short is = tx*NSG + j;
+            dst_state[is*S_v] = lsf[j];
+        }
     }
 
 #undef S_v

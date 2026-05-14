@@ -1594,6 +1594,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne5, op->src[5], ne);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
@@ -1629,6 +1630,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.ns02 =*/ (int32_t) (nb02/sizeof(float)),
         /*.ns12 =*/ (int32_t) (nb12/sizeof(float)),
         /*.ns22 =*/ (int32_t) (nb22/sizeof(float)),
+        /*.n_state_slots =*/ ne51,
         /*.ne0  =*/ ne0,
         /*.ne1  =*/ ne1,
         /*.ne2  =*/ ne2,
