@@ -1456,31 +1456,19 @@ done:
 }
 
 void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(ctx);
-
     auto * mem = llama_get_memory(ctx);
-    GGML_ASSERT(mem != nullptr);
-
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
 
 void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(ctx);
-
     auto * mem = llama_get_memory(ctx);
-    GGML_ASSERT(mem != nullptr);
-
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    GGML_ASSERT(ctx);
-
     auto * mem = llama_get_memory(ctx);
-    GGML_ASSERT(mem != nullptr);
-
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
 
