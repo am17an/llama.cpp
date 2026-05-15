@@ -743,7 +743,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         cell_ranges.emplace_back(cell_range_begin, size);
     }
 
-    if (flags % LLAMA_STATE_SEQ_FLAGS_ON_DEVICE && cell_ranges.size() > 1) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cell_ranges.size() > 1) {
         GGML_ABORT("cannot save/load multiple ranges of cells to/from device memory\n");
     }
 
