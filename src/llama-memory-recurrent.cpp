@@ -719,15 +719,6 @@ size_t llama_memory_recurrent::size_s_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
-    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
-    if (n_rs_seq != 0) {
-        for (uint32_t i = 0; i < rs_idx.size(); ++i) {
-            if (rs_idx[i] != 0) {
-                GGML_ABORT("recurrent state read/write is not supported with partial rollback");
-            }
-        }
-    }
-
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     uint32_t cell_count = 0;
 
@@ -767,6 +758,21 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     state_write_meta(io, cell_ranges, seq_id);
     state_write_data(io, cell_ranges);
+
+    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
+    // Serialize per-seq rollback indices AFTER all tensor data so stream order matches
+    // state_read, which restores them after state_read_data. s_copy then applies the
+    // rollback on the next forward pass exactly as without the save/restore round-trip.
+    if (n_rs_seq != 0) {
+        if (seq_id >= 0) {
+            const uint32_t idx = ((size_t) seq_id < rs_idx.size()) ? rs_idx[seq_id] : 0;
+            io.write(&idx, sizeof(idx));
+        } else {
+            for (uint32_t i = 0; i < (uint32_t) rs_idx.size(); ++i) {
+                io.write(&rs_idx[i], sizeof(rs_idx[i]));
+            }
+        }
+    }
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -779,6 +785,21 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     res = res && state_read_meta(io, cell_count, seq_id);
     res = res && state_read_data(io, cell_count);
+
+    // Restore per-seq rollback indices serialized by state_write
+    if (res && n_rs_seq != 0) {
+        if (seq_id >= 0) {
+            uint32_t idx = 0;
+            io.read(&idx, sizeof(idx));
+            set_rs_idx(seq_id, idx);
+        } else {
+            for (uint32_t i = 0; i < (uint32_t) rs_idx.size(); ++i) {
+                uint32_t idx = 0;
+                io.read(&idx, sizeof(idx));
+                set_rs_idx((llama_seq_id) i, idx);
+            }
+        }
+    }
 
     if (!res) {
         if (seq_id == -1) {
@@ -886,6 +907,34 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                     const size_t src_offset = (range.first + j * mem_size) * s_size_el;
                     const size_t buf_size = range_size * s_size_el;
                     io.write_tensor(s_l[il], src_offset, buf_size);
+                }
+            }
+        }
+    }
+
+    // Write snapshot rows for partial rollback support.
+    // Snapshot k is stored at row (k * size + cell_id) in each tensor and is what
+    // s_copy reads when rs_idx[seq] == k, i.e. the recurrent state from k tokens ago.
+    if (n_rs_seq != 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (r_l[il] == nullptr) continue;
+            const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            for (uint32_t k = 1; k <= n_rs_seq; ++k) {
+                for (const auto & range : cell_ranges) {
+                    const size_t range_size = range.second - range.first;
+                    io.write_tensor(r_l[il], (k * size + range.first) * r_size_row, range_size * r_size_row);
+                }
+            }
+        }
+        if (!s_trans) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (s_l[il] == nullptr) continue;
+                const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+                for (uint32_t k = 1; k <= n_rs_seq; ++k) {
+                    for (const auto & range : cell_ranges) {
+                        const size_t range_size = range.second - range.first;
+                        io.write_tensor(s_l[il], (k * size + range.first) * s_size_row, range_size * s_size_row);
+                    }
                 }
             }
         }
@@ -1104,6 +1153,26 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 for (uint32_t j = 0; j < n_embd_s; ++j) {
                     const size_t dst_offset = (head + j * size) * s_size_el;
                     io.read_tensor(s_l[il], dst_offset, cell_count * s_size_el);
+                }
+            }
+        }
+    }
+
+    // Read snapshot rows for partial rollback support
+    if (n_rs_seq != 0 && cell_count != 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (r_l[il] == nullptr) continue;
+            const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            for (uint32_t k = 1; k <= n_rs_seq; ++k) {
+                io.read_tensor(r_l[il], (k * size + head) * r_size_row, cell_count * r_size_row);
+            }
+        }
+        if (!s_trans) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (s_l[il] == nullptr) continue;
+                const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+                for (uint32_t k = 1; k <= n_rs_seq; ++k) {
+                    io.read_tensor(s_l[il], (k * size + head) * s_size_row, cell_count * s_size_row);
                 }
             }
         }
