@@ -1,0 +1,45 @@
+name: Build Windows CUDA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout mtp-clean
+        uses: actions/checkout@v4
+        with:
+          ref: mtp-clean
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup CUDA
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: "12.4.1"
+          method: network
+
+      - name: Configure
+        run: cmake -B build -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DGGML_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j --clean-first --target llama-cli llama-server
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact
+          Copy-Item build/bin/Release/llama-server.exe artifact/
+          Copy-Item build/bin/Release/llama-cli.exe artifact/
+          Copy-Item build/bin/Release/*.dll artifact/ -ErrorAction SilentlyContinue
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-mtp-windows-cuda
+          path: artifact/*
