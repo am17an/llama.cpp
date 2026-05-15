@@ -750,6 +750,35 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        // [TAG_RS_STATE_ROLLBACK_SUPPORT]
+        // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
+        //       currently this is not supported. so we enable partial rollback only when MTP runs on its own
+        //       in this case, we don't have to do checkpoints to perform speculative decoding
+        if (llama_n_rs_seq(ctx_tgt) > 0) {
+            bool print_warning = true;
+
+            auto & types = params_base.speculative.types;
+
+            // filter all non-MTP speculative types
+            for (int i = 0; i < (int) params_base.speculative.types.size(); i++) {
+                if (types[i] == COMMON_SPECULATIVE_TYPE_NONE) {
+                    continue;
+                }
+                if (types[i] != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    if (print_warning && !types.empty()) {
+                        SRV_WRN("%s", "partial recurrent rollback is enabled, only MTP speculative decoding is supported\n");
+                    }
+
+                    SRV_WRN("removing speculative type %d (%s) from speculative types\n",
+                            types[i], common_speculative_type_to_str(types[i]).c_str());
+                    types.erase(types.begin() + i);
+
+                    print_warning = false;
+                    i--;
+                }
+            }
+        }
+
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
