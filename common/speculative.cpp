@@ -1497,7 +1497,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     // TODO: currently only the implementation that generated the draft is used to accept it
     //       however, some implementations (such as MTP) need to also "see" the accepted tokens
     //       extend `common_speculative_impl::accept()` with an extra argument `bool is_other` to
-    //       inform the implementation if the accepted tokens are from another implementation
+    //       inform the implementation if the accepted tokens are from another implementation and
+    //       pass the accepted tokens to all remaining implementations using `is_other == true`
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
         if (n_accepted > 0) {
