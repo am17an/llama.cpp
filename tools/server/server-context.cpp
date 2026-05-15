@@ -752,8 +752,7 @@ private:
 
         // [TAG_RS_STATE_ROLLBACK_SUPPORT]
         // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
-        //       currently this is not supported. so we enable partial rollback only when MTP runs on its own
-        //       in this case, we don't have to do checkpoints to perform speculative decoding
+        //       currently this is not supported. so we remove the non-MTP types from the list
         if (llama_n_rs_seq(ctx_tgt) > 0) {
             bool print_warning = true;
 
