@@ -566,7 +566,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+        if (self_v_idxs) {
+            mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+        }
 
         mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
@@ -574,7 +576,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+        if (self_v_idxs_swa) {
+            mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+        }
 
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
@@ -2947,8 +2951,6 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
 
     {
         inp_raw->self_k_idxs = raw_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
-        inp_raw->self_v_idxs = raw_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
-
         inp_raw->self_kq_mask = build_attn_inp_kq_mask(ctx0, raw_ctx->get_base(), ubatch, cparams);
         inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
     }
@@ -2957,18 +2959,12 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
         inp_raw->self_k_idxs_swa = raw_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
-        inp_raw->self_v_idxs_swa = raw_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
-
         inp_raw->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, raw_ctx->get_swa(), ubatch, cparams);
         inp_raw->self_kq_mask_swa_cnv = inp_raw->self_kq_mask_swa;
     }
 
     inp_raw->self_k_rot = raw_ctx->get_base()->build_input_k_rot(ctx0);
-    inp_raw->self_v_rot = raw_ctx->get_base()->build_input_v_rot(ctx0);
-
     inp_raw->self_k_rot_swa = raw_ctx->get_swa()->build_input_k_rot(ctx0);
-    inp_raw->self_v_rot_swa = raw_ctx->get_swa()->build_input_v_rot(ctx0);
-
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(), "csa");
