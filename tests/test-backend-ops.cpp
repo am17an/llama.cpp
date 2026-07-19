@@ -8625,6 +8625,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 64, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 2));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 64, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 2));
+
+    // W4A16 path coverage (n % 256 == 0, m % 32 == 0, k % 256 == 0)
+    for (int64_t m : {32, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  256, m,  256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  512, m, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 3840, m, 1536, {1, 1}, {1, 1}));
+    }
+    // W6A16 path coverage
+    for (int64_t m : {32, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  256, m,  256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  512, m, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 3840, m, 1536, {1, 1}, {1, 1}));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
@@ -9642,6 +9660,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // gemma-4-12B dense shapes (W4A16 experiments)
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  3840, 512,  3840, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 15360, 512,  3840, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  3840, 512, 15360, {1, 1}, {1, 1}));
+    }
+    // gemma-4-12B Q6_K shapes (W6A16 experiments): ffn_down, attn_v, output logits
+    for (ggml_type type_a : {GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  3840, 512, 15360, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  2048, 512,  3840, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 512,  3840, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 262144, 512, 3840, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b
