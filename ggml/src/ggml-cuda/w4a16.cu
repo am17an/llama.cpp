@@ -36,6 +36,35 @@ static void launch_w4a16_kernel(int W, const void * sidecar, const half * activa
     }
 }
 
+template <typename cfg>
+static void launch_w4a16_pair_kernel(int W, const void * sidecar0, const void * sidecar1, const half * activation_f16,
+                                     ggml_tensor * dst0, ggml_tensor * dst1, int k, int n0, int n1, int m,
+                                     cudaStream_t stream) {
+    const dim3 block(WARP_SIZE, cfg::WARPS, 1);
+    const dim3 grid((n0 + n1) / W4A16_N_TILE, m / cfg::M_TILE, 1);
+    if (W == 6) {
+        static bool raised6 = false;
+        if (!raised6) {
+            CUDA_CHECK(cudaFuncSetAttribute((mul_mat_w4a16_pair<cfg, 6>), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)w4a16_shared_bytes<cfg, 6>()));
+            raised6 = true;
+        }
+        mul_mat_w4a16_pair<cfg, 6><<<grid, block, w4a16_shared_bytes<cfg, 6>(), stream>>>(
+            static_cast<const uint8_t *>(sidecar0), static_cast<const uint8_t *>(sidecar1), activation_f16,
+            static_cast<float *>(dst0->data), static_cast<float *>(dst1->data), k, n0, n1, m);
+    } else {
+        static bool raised4 = false;
+        if (!raised4) {
+            CUDA_CHECK(cudaFuncSetAttribute((mul_mat_w4a16_pair<cfg, 4>), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)w4a16_shared_bytes<cfg, 4>()));
+            raised4 = true;
+        }
+        mul_mat_w4a16_pair<cfg, 4><<<grid, block, w4a16_shared_bytes<cfg, 4>(), stream>>>(
+            static_cast<const uint8_t *>(sidecar0), static_cast<const uint8_t *>(sidecar1), activation_f16,
+            static_cast<float *>(dst0->data), static_cast<float *>(dst1->data), k, n0, n1, m);
+    }
+}
+
 static bool w4a16_weight_eligible(int device, const ggml_tensor * tensor) {
     if (!w4a16_enabled() || ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_DGX_SPARK) {
         return false;
@@ -156,6 +185,65 @@ void ggml_cuda_mul_mat_w4a16(ggml_backend_cuda_context & ctx,
         using cfg = w4a16_cfg<32, 32, 64, 3>;
         launch_w4a16_kernel<cfg>(W, sidecar, activation_f16, dst, k, n, m, ctx.stream());
     }
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+bool ggml_cuda_w4a16_pair_compatible(const ggml_tensor * node, const ggml_tensor * partner, int cc) {
+    if (node->op != GGML_OP_MUL_MAT || partner->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const char * fuse_env = std::getenv("GGML_CUDA_W4A16_FUSE");
+    if (fuse_env != nullptr && fuse_env[0] == '0') {
+        return false;
+    }
+    const ggml_tensor * src0_a  = node->src[0];
+    const ggml_tensor * src0_b  = partner->src[0];
+    const ggml_tensor * src1    = node->src[1];
+    if (partner->src[1] != src1 || src0_a == src0_b || node == partner) {
+        return false;
+    }
+    if (src0_a->type != src0_b->type) {
+        return false;
+    }
+    // only fuse the large-n short-k class (up/gate projections), where the fused launch wins
+    const bool a_ok = src0_a->type == GGML_TYPE_Q4_K && src0_a->ne[1] >= 8192 && src0_a->ne[0] <= 4096;
+    const bool b_ok = src0_b->type == GGML_TYPE_Q4_K && src0_b->ne[1] >= 8192 && src0_b->ne[0] <= 4096;
+    if (!a_ok || !b_ok) {
+        return false;
+    }
+    return src0_a->ne[0] == src0_b->ne[0] && (src0_a->ne[1] + src0_b->ne[1]) % W4A16_N_TILE == 0 &&
+           ggml_cuda_should_use_w4a16(src0_a, src1, node, cc) && ggml_cuda_should_use_w4a16(src0_b, src1, partner, cc) &&
+           src1->ne[1] % 128 == 0;
+}
+
+void ggml_cuda_mul_mat_w4a16_pair(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor *         src0_a,
+                                  const ggml_tensor *         src0_b,
+                                  const ggml_tensor *         src1,
+                                  ggml_tensor *               dst_a,
+                                  ggml_tensor *               dst_b,
+                                  const void *                sidecar_a,
+                                  const void *                sidecar_b,
+                                  const half *                activation_f16) {
+    const int k  = src0_a->ne[0];
+    const int n0 = src0_a->ne[1];
+    const int n1 = src0_b->ne[1];
+    const int m  = src1->ne[1];
+    GGML_ASSERT(k == src0_b->ne[0] && (n0 + n1) % W4A16_N_TILE == 0);
+
+    ggml_cuda_pool_alloc<half> activation_storage(ctx.pool());
+    if (activation_f16 == nullptr) {
+        activation_f16 = activation_storage.alloc(size_t(k) * m);
+        ggml_cuda_convert_w4a16_activation(ctx, src1, activation_storage.get());
+    }
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(sidecar_a, sidecar_b);
+    GGML_ABORT("W4A16 is only implemented for CUDA");
+#else
+    using cfg = w4a16_cfg<128, 64, 64, 3>;
+    launch_w4a16_pair_kernel<cfg>(4, sidecar_a, sidecar_b, activation_f16, dst_a, dst_b, k, n0, n1, m, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
 #endif
 }

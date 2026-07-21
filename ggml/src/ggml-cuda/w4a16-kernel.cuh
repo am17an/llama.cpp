@@ -516,15 +516,129 @@ __launch_bounds__(Cfg::WARPS * WARP_SIZE, 1) static __global__ void mul_mat_w4a1
 
     const int row0 = m0 + warp_m * M_WARP + threadIdx.x / 4;
     const int col0 = n_tile * W4A16_N_TILE + warp_n * N_WARP + 2 * (threadIdx.x % 4);
-#    pragma unroll
+#pragma unroll
     for (int m_fragment = 0; m_fragment < M_WARP / 16; ++m_fragment) {
-#    pragma unroll
+#pragma unroll
         for (int fragment = 0; fragment < N_WARP / 8; ++fragment) {
             float2 * dst0 = reinterpret_cast<float2 *>(dst + int64_t(row0 + m_fragment * 16) * n + col0 + fragment * 8);
             float2 * dst1 =
                 reinterpret_cast<float2 *>(dst + int64_t(row0 + m_fragment * 16 + 8) * n + col0 + fragment * 8);
             *dst0 = make_float2(accum[m_fragment][fragment].x[0], accum[m_fragment][fragment].x[1]);
             *dst1 = make_float2(accum[m_fragment][fragment].x[2], accum[m_fragment][fragment].x[3]);
+        }
+    }
+}
+
+// Fused pair GEMM: two weight tensors (same k, same activation) in one launch.
+// Each block's 256-column tile lies entirely within one tensor, so the inner loop is
+// identical to mul_mat_w4a16; only the sidecar and dst pointers are selected per block.
+template <typename Cfg = w4a16_default_cfg, int W = 4>
+__launch_bounds__(Cfg::WARPS * WARP_SIZE, 1) static __global__ void mul_mat_w4a16_pair(const uint8_t * __restrict__ sidecar0,
+                                                                                      const uint8_t * __restrict__ sidecar1,
+                                                                                      const half * __restrict__ activation,
+                                                                                      float * __restrict__ dst0,
+                                                                                      float * __restrict__ dst1,
+                                                                                      int k, int n0, int n1, int m) {
+    GGML_UNUSED(m);
+
+    constexpr int M_TILE = Cfg::M_TILE;
+    constexpr int M_WARP = Cfg::M_WARP;
+    constexpr int N_WARP = Cfg::N_WARP;
+    constexpr int STAGES = Cfg::STAGES;
+
+    __align__(16) extern __shared__ uint8_t shared_raw[];
+    half *                                  shared_a = reinterpret_cast<half *>(shared_raw);
+    uint32_t * shared_q = reinterpret_cast<uint32_t *>(shared_raw + STAGES * Cfg::A_STAGE_BYTES);
+    uint32_t * shared_meta =
+        reinterpret_cast<uint32_t *>(shared_raw + STAGES * (Cfg::A_STAGE_BYTES + w4a16_fmt<W>::Q_WORDS * sizeof(uint32_t)));
+
+    const int n0_tiles  = n0 / W4A16_N_TILE;
+    const int n_tile    = blockIdx.x;
+    const bool second   = n_tile >= n0_tiles;
+    const int tile_idx  = second ? n_tile - n0_tiles : n_tile;
+    const uint8_t * sidecar = second ? sidecar1 : sidecar0;
+    const int dst_n     = second ? n1 : n0;
+    float * dst         = second ? dst1 : dst0;
+
+    const int m0     = blockIdx.y * M_TILE;
+    const int groups = k / W4A16_K_GROUP;
+    const int warp_m = threadIdx.y / Cfg::N_WARPS;
+    const int warp_n = threadIdx.y % Cfg::N_WARPS;
+
+    tile<16, 8, float> accum[M_WARP / 16][N_WARP / 8];
+
+    issue_w4a16_stage<Cfg, W>(activation, sidecar, shared_a, shared_q, shared_meta, k, groups, m0, tile_idx, 0, 0);
+    if (groups > 1) {
+        issue_w4a16_stage<Cfg, W>(activation, sidecar, shared_a, shared_q, shared_meta, k, groups, m0, tile_idx, 1, 1);
+    }
+
+    for (int group = 0; group < groups; ++group) {
+        if (group + 1 < groups) {
+            wait_w4a16_copies<1>();
+        } else {
+            wait_w4a16_copies<0>();
+        }
+        __syncthreads();
+
+        if (group + 2 < groups) {
+            issue_w4a16_stage<Cfg, W>(activation, sidecar, shared_a, shared_q, shared_meta, k, groups, m0, tile_idx,
+                                      group + 2, (group + 2) % STAGES);
+        }
+
+        const int     stage   = group % STAGES;
+        const half2 * a_stage = reinterpret_cast<const half2 *>(
+            shared_a + stage * (Cfg::A_STAGE_BYTES / sizeof(half)) + warp_m * M_WARP * W4A16_A_STRIDE);
+        const uint32_t * q_stage    = shared_q + stage * w4a16_fmt<W>::Q_WORDS;
+        const uint32_t * meta_stage = shared_meta + stage * w4a16_fmt<W>::META_WORDS;
+
+        tile<16, 8, half2> a[M_WARP / 16][2];
+#pragma unroll
+        for (int m_fragment = 0; m_fragment < M_WARP / 16; ++m_fragment) {
+            const half2 * a_fragment = a_stage + m_fragment * 16 * (W4A16_A_STRIDE / 2);
+            load_w4a16_a(a[m_fragment][0], a_fragment, 0);
+            load_w4a16_a(a[m_fragment][1], a_fragment, 2);
+        }
+
+        tile<8, 8, half2> b[3][2];
+        if constexpr (W == 4) {
+            load_w4a16_b<Cfg>(q_stage, meta_stage, warp_n, 0, b[0][0], b[0][1]);
+            load_w4a16_b<Cfg>(q_stage, meta_stage, warp_n, 1, b[1][0], b[1][1]);
+        } else {
+            load_w6a16_b<Cfg>(q_stage, meta_stage, warp_n, 0, b[0][0], b[0][1]);
+            load_w6a16_b<Cfg>(q_stage, meta_stage, warp_n, 1, b[1][0], b[1][1]);
+        }
+#pragma unroll
+        for (int fragment = 0; fragment < N_WARP / 8; ++fragment) {
+            const int current = fragment % 3;
+            if (fragment + 2 < N_WARP / 8) {
+                const int next = (fragment + 2) % 3;
+                if constexpr (W == 4) {
+                    load_w4a16_b<Cfg>(q_stage, meta_stage, warp_n, fragment + 2, b[next][0], b[next][1]);
+                } else {
+                    load_w6a16_b<Cfg>(q_stage, meta_stage, warp_n, fragment + 2, b[next][0], b[next][1]);
+                }
+            }
+#pragma unroll
+            for (int k16 = 0; k16 < 2; ++k16) {
+#pragma unroll
+                for (int m_fragment = 0; m_fragment < M_WARP / 16; ++m_fragment) {
+                    mma(accum[m_fragment][fragment], a[m_fragment][k16], b[current][k16]);
+                }
+            }
+        }
+    }
+
+    const int row0 = m0 + warp_m * M_WARP + threadIdx.x / 4;
+    const int col0 = tile_idx * W4A16_N_TILE + warp_n * N_WARP + 2 * (threadIdx.x % 4);
+#pragma unroll
+    for (int m_fragment = 0; m_fragment < M_WARP / 16; ++m_fragment) {
+#pragma unroll
+        for (int fragment = 0; fragment < N_WARP / 8; ++fragment) {
+            float2 * out0 = reinterpret_cast<float2 *>(dst + int64_t(row0 + m_fragment * 16) * dst_n + col0 + fragment * 8);
+            float2 * out1 =
+                reinterpret_cast<float2 *>(dst + int64_t(row0 + m_fragment * 16 + 8) * dst_n + col0 + fragment * 8);
+            *out0 = make_float2(accum[m_fragment][fragment].x[0], accum[m_fragment][fragment].x[1]);
+            *out1 = make_float2(accum[m_fragment][fragment].x[2], accum[m_fragment][fragment].x[3]);
         }
     }
 }
@@ -539,6 +653,17 @@ static __global__ void mul_mat_w4a16(const uint8_t * __restrict__ sidecar,
                                      int n,
                                      int m) {
     GGML_UNUSED_VARS(sidecar, activation, dst, k, n, m);
+    NO_DEVICE_CODE;
+}
+
+template <typename Cfg = w4a16_default_cfg, int W = 4>
+static __global__ void mul_mat_w4a16_pair(const uint8_t * __restrict__ sidecar0,
+                                          const uint8_t * __restrict__ sidecar1,
+                                          const half * __restrict__ activation,
+                                          float * __restrict__ dst0,
+                                          float * __restrict__ dst1,
+                                          int k, int n0, int n1, int m) {
+    GGML_UNUSED_VARS(sidecar0, sidecar1, activation, dst0, dst1, k, n0, n1, m);
     NO_DEVICE_CODE;
 }
 

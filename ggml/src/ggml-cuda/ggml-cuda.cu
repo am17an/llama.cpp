@@ -4125,6 +4125,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // W4A16 pair fusion: two eligible mul_mats sharing an activation run as one GEMM.
+                if (i + 1 < cgraph->n_nodes &&
+                    ggml_cuda_w4a16_pair_compatible(node, cgraph->nodes[i + 1],
+                                                    ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                    ggml_tensor * partner = cgraph->nodes[i + 1];
+                    const half * activation_f16 = w4a16_activation_cache.acquire(node->src[1]);
+                    ggml_cuda_mul_mat_w4a16_pair(*cuda_ctx, node->src[0], partner->src[0], node->src[1], node, partner,
+                                                 ggml_cuda_get_valid_w4a16_sidecar(node->src[0]),
+                                                 ggml_cuda_get_valid_w4a16_sidecar(partner->src[0]), activation_f16);
+                    w4a16_activation_cache.release(node->src[1]);
+                    i += 1;
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
