@@ -15,6 +15,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1796,6 +1797,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+static bool moe_ffn_fused_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MOE_FFN");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1824,6 +1833,37 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // fused MoE FFN, currently only for the softmax+norm+swiglu pattern without biases/scales/lora
+    // small batches stay on the unfused path, which uses the faster mmvq kernels
+    if (moe_ffn_fused_enabled() && n_tokens >= 64 &&
+        !weight_before_ffn && arch != LLM_ARCH_GROVEMOE &&
+        gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX &&
+        type_op == LLM_FFN_SILU && norm_w &&
+        (w_scale == 0.0f || w_scale == 1.0f) &&
+        probs_in == nullptr && selected_experts_in == nullptr &&
+        gate_inp_b == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+        exp_probs_b == nullptr && gate_up_exps_b == nullptr &&
+        up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
+        (gate_up_exps != nullptr || gate_exps != nullptr) &&
+        hparams.n_expert_groups <= 1 &&
+        (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f) &&
+        gate_inp->type == GGML_TYPE_F32 &&
+        (gate_up_exps != nullptr || up_exps->type == gate_exps->type) &&
+        ggml_is_quantized(down_exps->type) && down_exps->type != GGML_TYPE_MXFP4 && down_exps->type != GGML_TYPE_NVFP4 &&
+        ggml_is_contiguous(cur) && cur->ne[2] == 1 &&
+        (loras == nullptr || loras->empty())) {
+        ggml_tensor * upgate = gate_up_exps ? gate_up_exps : up_exps;
+
+        if (ggml_is_quantized(upgate->type) &&
+            upgate->type != GGML_TYPE_MXFP4 && upgate->type != GGML_TYPE_NVFP4) {
+            ggml_tensor * moe_out = ggml_moe_ffn(ctx0, cur, gate_inp,
+                upgate, gate_up_exps ? nullptr : gate_exps, down_exps, n_expert_used);
+            cb(moe_out, "ffn_moe_out", il);
+
+            return moe_out;
+        }
+    }
 
     ggml_tensor * logits = nullptr;
 

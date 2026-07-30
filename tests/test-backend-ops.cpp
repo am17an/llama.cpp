@@ -4393,6 +4393,65 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// GGML_OP_MOE_FFN
+struct test_moe_ffn : public test_case {
+    const ggml_type type_up;
+    const ggml_type type_down;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int n_expert;
+    const int n_expert_used;
+    const int64_t n_tokens;
+    const bool merged; // gate and up stored as one tensor
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_up, type_down, n_embd, n_ff, n_expert, n_expert_used, n_tokens, merged);
+    }
+
+    double max_nmse_err() override {
+        // three chained quantized GEMMs, each at mul_mat_id-level error
+        return 2e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * n_tokens * (n_expert*n_embd + n_expert_used*3*n_embd*n_ff);
+    }
+
+    test_moe_ffn(ggml_type type_up = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q4_K,
+            int64_t n_embd = 256, int64_t n_ff = 256, int n_expert = 32, int n_expert_used = 4, int64_t n_tokens = 96,
+            bool merged = false)
+        : type_up(type_up), type_down(type_down), n_embd(n_embd), n_ff(n_ff),
+          n_expert(n_expert), n_expert_used(n_expert_used), n_tokens(n_tokens), merged(merged) {
+        GGML_ASSERT(n_expert_used <= n_expert);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        ggml_set_name(gate_inp, "gate_inp");
+
+        ggml_tensor * up_exps = ggml_new_tensor_3d(ctx, type_up, n_embd, merged ? 2*n_ff : n_ff, n_expert);
+        ggml_set_name(up_exps, merged ? "gate_up_exps" : "up_exps");
+
+        ggml_tensor * gate_exps = nullptr;
+        if (!merged) {
+            gate_exps = ggml_new_tensor_3d(ctx, type_up, n_embd, n_ff, n_expert);
+            ggml_set_name(gate_exps, "gate_exps");
+        }
+
+        ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type_down, n_ff, n_embd, n_expert);
+        ggml_set_name(down_exps, "down_exps");
+
+        ggml_tensor * out = ggml_moe_ffn(ctx, x, gate_inp, up_exps, gate_exps, down_exps, n_expert_used);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -8830,6 +8889,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    for (ggml_type type_up : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (ggml_type type_down : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_moe_ffn(type_up, type_down, 256, 256, 32, 4, 96));
+        }
+    }
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 32, 4, 1));
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 32, 32, 17));
+    // Qwen3.6-35B-A3B shapes
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 512, 256, 8, 128));
+    // merged gate_up
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  256, 256, 32, 4,  96, true));
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_0, GGML_TYPE_Q4_K,  256, 256, 32, 4,  96, true));
+    test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 512, 256, 8, 128, true));
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -9674,6 +9747,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  2048, 512,  3840, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 512,  3840, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 262144, 512, 3840, {1, 1}, {1, 1}));
+    }
+
+    // Qwen3.6-35B-A3B-UD-Q4_K_M MoE FFN
+    for (int bs : {64, 128, 512, 2048}) {
+        for (bool merged : {false, true}) {
+            test_cases.emplace_back(new test_moe_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 512, 256, 8, bs, merged));
+        }
     }
 
     // qwen3-30b-a3b

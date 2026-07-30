@@ -53,6 +53,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/moe-ffn.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -2342,6 +2343,9 @@ static bool ggml_cuda_compute_forward(
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MOE_FFN:
+            ggml_cuda_moe_ffn(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4936,6 +4940,47 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     default:
                         return false;
                 }
+            } break;
+        case GGML_OP_MOE_FFN:
+            {
+                const ggml_tensor * x         = op->src[0];
+                const ggml_tensor * gate_inp  = op->src[1];
+                const ggml_tensor * up_exps   = op->src[2];
+                const ggml_tensor * down_exps = op->src[4];
+
+                if (x->type != GGML_TYPE_F32 || gate_inp->type != GGML_TYPE_F32) {
+                    return false;
+                }
+
+                // merged gate_up is split by pointer offset, which has to stay float4-aligned
+                if (!op->src[3] && (up_exps->ne[1]/2) % 4 != 0) {
+                    return false;
+                }
+
+                // needs an instantiation of the topk-moe kernel
+                const int64_t n_expert = gate_inp->ne[1];
+                if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
+                    return false;
+                }
+
+                const int    cc    = ggml_cuda_info().devices[dev_ctx->device].cc;
+                const size_t smpbo = ggml_cuda_info().devices[dev_ctx->device].smpbo;
+
+                // mm_ids_helper keeps all token slots of one expert in shared memory
+                if (x->ne[1]*sizeof(int32_t) > smpbo) {
+                    return false;
+                }
+
+                for (const ggml_tensor * exps : { up_exps, down_exps }) {
+                    // native fp4 uses a different src1 quantization, not implemented here
+                    if (exps->type == GGML_TYPE_MXFP4 || exps->type == GGML_TYPE_NVFP4) {
+                        return false;
+                    }
+                    if (!ggml_cuda_should_use_mmq(exps->type, cc, x->ne[1], n_expert)) {
+                        return false;
+                    }
+                }
+                return true;
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

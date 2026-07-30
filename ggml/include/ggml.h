@@ -587,6 +587,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_FFN,
+
         GGML_OP_COUNT,
     };
 
@@ -1444,6 +1446,18 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // fused MoE FFN with softmax routing, top-n_expert_used selection and normalized weights:
+    //   out = sum_k w_k * down_exps[e_k] @ (silu(gate_exps[e_k] @ x) * (up_exps[e_k] @ x))
+    // gate_exps may be NULL, then up_exps holds the gate and up rows merged into one tensor
+    GGML_API struct ggml_tensor * ggml_moe_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate_inp,
+            struct ggml_tensor  * up_exps,
+            struct ggml_tensor  * gate_exps,
+            struct ggml_tensor  * down_exps,
+            int                   n_expert_used);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
