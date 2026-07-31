@@ -661,8 +661,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
                 if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
                     GGML_ASSERT(segments.size() == 1);
-                    // the grouped output projection requires each device to hold whole groups of heads
-                    const int64_t n_head_group = hparams.n_head(il) / hparams.dsv4_o_group_count;
                     return {n_head_group * hparams.n_embd_head_k(il)};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_out_a_weight) ||
