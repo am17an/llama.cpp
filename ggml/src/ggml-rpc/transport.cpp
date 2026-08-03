@@ -44,6 +44,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #ifdef GGML_RPC_RDMA
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+static constexpr size_t RDMA_SEND_DEPTH = 4;
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
 using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 
@@ -117,6 +118,7 @@ struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
+    bool send_data(const socket_iovec * iov, size_t n);
     bool recv_data(void * data, size_t size);
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
@@ -128,6 +130,7 @@ struct socket_t::impl {
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
     bool rdma_send(const void * data, size_t size);
+    bool rdma_send(const socket_iovec * iov, size_t n);
     bool rdma_recv(void * data, size_t size);
 
     std::unique_ptr<rdma_conn> rdma;
@@ -283,7 +286,7 @@ bool socket_t::impl::rdma_probe() {
     qia.send_cq = rdma->scq;
     qia.recv_cq = rdma->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = RDMA_SEND_DEPTH;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -437,6 +440,79 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
     return true;
 }
 
+bool socket_t::impl::rdma_send(const socket_iovec * iov, size_t n) {
+    rdma_conn * c = rdma.get();
+    size_t n_active = 0;
+    size_t n_registered = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (iov[i].size == 0) {
+            continue;
+        }
+        n_active++;
+        if (iov[i].size > c->max_inline) {
+            n_registered++;
+        }
+    }
+
+    if (n_active == 0) {
+        return true;
+    }
+    if (n_active > RDMA_SEND_DEPTH || n_registered > 1) {
+        for (size_t i = 0; i < n; ++i) {
+            if (!rdma_send(iov[i].data, iov[i].size)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::array<struct ibv_sge, RDMA_SEND_DEPTH> sges = {};
+    std::array<struct ibv_send_wr, RDMA_SEND_DEPTH> wrs = {};
+    size_t j = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (iov[i].size == 0) {
+            continue;
+        }
+        if (iov[i].size > RDMA_CHUNK) {
+            for (size_t k = 0; k < n; ++k) {
+                if (!rdma_send(iov[k].data, iov[k].size)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        wrs[j].opcode  = IBV_WR_SEND;
+        wrs[j].sg_list = &sges[j];
+        wrs[j].num_sge = 1;
+
+        if (iov[i].size <= c->max_inline) {
+            sges[j].addr   = (uintptr_t)iov[i].data;
+            sges[j].length = iov[i].size;
+            wrs[j].send_flags = IBV_SEND_INLINE;
+        } else {
+            memcpy(c->tx_buf, iov[i].data, iov[i].size);
+            sges[j].addr   = (uintptr_t)c->tx_buf;
+            sges[j].length = iov[i].size;
+            sges[j].lkey   = c->tx_mr->lkey;
+        }
+        if (j > 0) {
+            wrs[j - 1].next = &wrs[j];
+        }
+        j++;
+    }
+
+    wrs[j - 1].send_flags |= IBV_SEND_SIGNALED;
+    struct ibv_send_wr * bad = nullptr;
+    if (ibv_post_send(c->qp, &wrs[0], &bad) != 0) {
+        return false;
+    }
+    struct ibv_wc wc;
+    return rdma_poll(c->scq, &wc);
+}
+
 bool socket_t::impl::rdma_recv(void * data, size_t size) {
     rdma_conn * c = rdma.get();
     uint8_t * dst = (uint8_t *)data;
@@ -475,6 +551,20 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
             return false;
         }
         bytes_sent += (size_t)n;
+    }
+    return true;
+}
+
+bool socket_t::impl::send_data(const socket_iovec * iov, size_t n) {
+#ifdef GGML_RPC_RDMA
+    if (use_rdma) {
+        return rdma_send(iov, n);
+    }
+#endif
+    for (size_t i = 0; i < n; ++i) {
+        if (!send_data(iov[i].data, iov[i].size)) {
+            return false;
+        }
     }
     return true;
 }
@@ -550,6 +640,10 @@ socket_t::~socket_t() = default;
 
 bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
+}
+
+bool socket_t::send_data(const socket_iovec * iov, size_t n) {
+    return pimpl->send_data(iov, n);
 }
 
 bool socket_t::recv_data(void * data, size_t size) {

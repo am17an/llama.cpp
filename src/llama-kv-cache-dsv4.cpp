@@ -568,19 +568,27 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         };
 
         if (dsv4_ubatch_has_coupled(ubatch)) {
-            if (plan.state_write_idxs.empty()) {
-                uint32_t i = 0;
-                while (i < ubatch.n_tokens && ubatch.pos[i] < 0) {
-                    ++i;
-                }
-                assert(i < ubatch.n_tokens);
+            const size_t n_blocks = (std::max<uint32_t>(1, ubatch.n_tokens) + ratio - 1)/ratio;
+            if (plan.state_write_idxs.size() > n_blocks) {
+                throw std::runtime_error("DSV4 coupled sequence positions are not contiguous");
+            }
+
+            uint32_t i = 0;
+            while (i < ubatch.n_tokens && ubatch.pos[i] < 0) {
+                ++i;
+            }
+            assert(i < ubatch.n_tokens);
+            while (plan.state_write_idxs.size() < n_blocks) {
                 append_dummy_block(ubatch.seq_id[i][0], i);
             }
         } else {
-            const uint32_t n_blocks = (std::max<uint32_t>(1, ubatch.n_seq_tokens) + ratio - 1)/ratio;
-
             for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+                uint32_t n_seq_tokens = 0;
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    n_seq_tokens += dsv4_token_has_seq(ubatch, i, seq_id);
+                }
+                const uint32_t n_blocks = (std::max<uint32_t>(1, n_seq_tokens) + ratio - 1)/ratio;
                 const uint32_t n_writes = state_write_counts[seq_id];
                 if (n_writes >= n_blocks) {
                     continue;

@@ -745,6 +745,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                (tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) &&
+                (tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
+            return src_ss[0];
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -986,7 +993,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
@@ -1119,6 +1127,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+}
+
+struct ggml_tensor * ggml_backend_meta_get_simple_tensor(const struct ggml_tensor * tensor, ggml_backend_dev_t device) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return nullptr;
+    }
+    if (ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return nullptr;
+    }
+
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    for (size_t i = 0; i < n_bufs; ++i) {
+        ggml_backend_buffer_t simple_buffer = ggml_backend_meta_buffer_simple_buffer(tensor->buffer, i);
+        if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(simple_buffer)) == device) {
+            return ggml_backend_meta_buffer_simple_tensor(tensor, i);
+        }
+    }
+    return nullptr;
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1367,6 +1393,22 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+static void ggml_backend_meta_buffer_memset_tensor(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        for (size_t j = 0; j < n_bufs; ++j) {
+            ggml_backend_tensor_memset(ggml_backend_meta_buffer_simple_tensor(tensor, j), value, offset, size);
+        }
+        return;
+    }
+
+    std::vector<uint8_t> data(size, value);
+    ggml_backend_meta_buffer_set_tensor(buffer, tensor, data.data(), offset, size);
+}
+
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -1486,7 +1528,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
@@ -1619,6 +1661,7 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
 
     void *                               comm_ctx       = nullptr;
+    ggml_backend_comm_free_t             comm_free      = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -1640,24 +1683,30 @@ struct ggml_backend_meta_context {
         name += ")";
 
         if (n_devs > 1) {
-            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-            if (comm_init != nullptr) {
+            for (ggml_backend_t simple_backend : simple_backends) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backend));
+                ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
+                if (comm_init == nullptr) {
+                    continue;
+                }
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
+                if (comm_ctx == nullptr) {
+                    continue;
+                }
+                comm_free = (ggml_backend_comm_free_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+                comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
+                GGML_ASSERT(comm_free != nullptr);
+                GGML_ASSERT(comm_allreduce != nullptr);
+                break;
             }
-        }
-        if (comm_ctx != nullptr) {
-            comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
-            GGML_ASSERT(comm_allreduce != nullptr);
         }
     }
 
     ~ggml_backend_meta_context() {
         if (comm_ctx != nullptr) {
-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
             GGML_ASSERT(comm_free != nullptr);
             comm_free(comm_ctx);
         }

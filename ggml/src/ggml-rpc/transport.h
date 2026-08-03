@@ -10,10 +10,16 @@ typedef std::shared_ptr<socket_t> socket_ptr;
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 
+struct socket_iovec {
+    const void * data;
+    size_t       size;
+};
+
 struct socket_t {
     ~socket_t();
 
     bool send_data(const void * data, size_t size);
+    bool send_data(const socket_iovec * iov, size_t n);
     bool recv_data(void * data, size_t size);
 
     socket_ptr accept();

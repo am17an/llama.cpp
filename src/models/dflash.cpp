@@ -4,6 +4,15 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+static ggml_tensor * dflash_get_shared_tensor(const llama_model & model, ggml_tensor * tensor) {
+    if (!model.devices.empty()) {
+        if (ggml_tensor * simple = ggml_backend_meta_get_simple_tensor(tensor, model.devices.front().dev)) {
+            return simple;
+        }
+    }
+    return tensor;
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -402,7 +411,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = dflash_get_shared_tensor(model, model_other->tok_embd);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -484,7 +493,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output = model_other->output;
+        output = dflash_get_shared_tensor(model, model_other->output);
     }
 
     cur = build_lora_mm(output, cur);
@@ -565,7 +574,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = dflash_get_shared_tensor(model, model_other->tok_embd);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -660,7 +669,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
-        output = model_other->output;
+        output = dflash_get_shared_tensor(model, model_other->output);
     }
 
     cur = build_lora_mm(output, cur);

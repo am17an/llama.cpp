@@ -2283,6 +2283,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        if (result.split_mode == LLAMA_SPLIT_MODE_TENSOR && !result.devices.empty() &&
+                (result.devices.size() == 1 || result.devices[1] == nullptr)) {
+            result.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;

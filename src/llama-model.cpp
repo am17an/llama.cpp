@@ -431,6 +431,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            const bool is_expert = tensor_name.find("_exps.") != std::string::npos;
+            if (is_expert && (std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_up_weight))) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_exps.weight");
+            }
+            if (is_expert && std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_exps.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
+            }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
