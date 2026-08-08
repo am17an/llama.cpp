@@ -152,9 +152,10 @@ struct common_speculative_impl {
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
-    int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
-    int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
-    int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_begin_us   = 0; // total time spent in refresh of this implementation in microseconds.
+    int64_t t_draft_us   = 0; // total time spent in generating drafts in this implementation in microseconds.
+    int64_t t_accept_us  = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_process_us = 0; // total time spent in process() of this implementation in microseconds.
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -177,6 +178,9 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // (optional) implementation-specific perf breakdown appended to the stats line
+    virtual std::string perf_extra() const { return ""; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -932,6 +936,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // perf breakdown (see perf_extra)
+    int64_t t_sync_us   = 0; // process: wait for in-flight target compute
+    int64_t t_gather_us = 0; // process: target feature readback + memcpy
+    int64_t t_enc_us    = 0; // process: encoder pass on ctx_dft (incl. output readback)
+    int64_t t_inj_us    = 0; // process: K/V-inject decode on ctx_dft
+    int64_t t_dec_us    = 0; // draft: noise-block decode on ctx_dft
+    int64_t t_smpl_us   = 0; // draft: sampling of the drafted block
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1056,6 +1068,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        {
+            common_time_meas tm_sync(t_sync_us);
+            llama_synchronize(ctx_tgt);
+        }
+
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1068,16 +1085,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                {
+                    common_time_meas tm_gather(t_gather_us);
+                    features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
                     }
                 }
 
@@ -1092,19 +1112,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                int32_t rc;
+                {
+                    common_time_meas tm_enc(t_enc_us);
+                    rc = llama_encode(ctx_dft, enc_batch);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+                {
+                    common_time_meas tm_enc(t_enc_us);
+                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                    // inject the DFlash decoder K/V cache at the tokens' target positions
+                    batch_inject.n_tokens = n_chunk;
+                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                }
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
@@ -1112,7 +1139,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
+                {
+                    common_time_meas tm_inj(t_inj_us);
+                    rc = llama_decode(ctx_dft, batch_inject);
+                    llama_synchronize(ctx_dft);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1159,12 +1190,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_decode(ctx_dft, batch);
+        int ret;
+        {
+            common_time_meas tm_dec(t_dec_us);
+            ret = llama_decode(ctx_dft, batch);
+            llama_synchronize(ctx_dft);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
 
+        common_time_meas tm_smpl(t_smpl_us);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1243,6 +1280,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+
+    std::string perf_extra() const override {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3)
+            << ", dflash dur(sync,gather,enc,inj,dec,smpl) = "
+            << t_sync_us   / 1000.0 << ", "
+            << t_gather_us / 1000.0 << ", "
+            << t_enc_us    / 1000.0 << ", "
+            << t_inj_us    / 1000.0 << ", "
+            << t_dec_us    / 1000.0 << ", "
+            << t_smpl_us   / 1000.0 << " ms";
+        return oss.str();
     }
 };
 
@@ -2283,6 +2333,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
+        // (the device list is null-terminated, so a single device means size 2)
+        const size_t n_devs = std::count_if(params_spec.devices.begin(), params_spec.devices.end(),
+                [](ggml_backend_dev_t d) { return d != nullptr; });
+        if (n_devs == 1) {
+            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
@@ -2535,6 +2593,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
         result = result && impl->process(batch);
     }
 
@@ -2718,9 +2777,10 @@ void common_speculative_print_stats(const common_speculative * spec) {
         if (impl->gen_perf) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_process_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
-            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            str_perf = ", dur(b,p,g,a) = " + oss.str() + " ms" + impl->perf_extra();
         } else {
             str_perf = "";
         }
