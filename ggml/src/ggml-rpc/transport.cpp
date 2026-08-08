@@ -17,9 +17,12 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
+#include <vector>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -118,8 +121,14 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    bool send_data_raw(const void * data, size_t size);
+    bool recv_data_raw(void * data, size_t size);
+    bool send_data_buffered(const void * data, size_t size);
+    bool flush_send();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+
+    std::vector<uint8_t> send_buf;
 
 #ifdef GGML_RPC_RDMA
     bool tcp_peer_closed();
@@ -135,9 +144,28 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+
+    std::vector<uint8_t> rx_pending; // excess bytes of a partially-consumed RDMA message
+    size_t               rx_off = 0;
 };
 
+// sockets with buffered outgoing data - flushed before any blocking receive (see flush_all_pending)
+static std::mutex g_pending_mutex;
+static std::unordered_set<socket_t::impl *> g_pending_sockets;
+
+static size_t rpc_batch_bytes() {
+    static const size_t threshold = [] {
+        const char * env = getenv("GGML_RPC_BATCH_BYTES");
+        return env != nullptr ? (size_t) std::max(0, atoi(env)) : (size_t) 4096;
+    }();
+    return threshold;
+}
+
 socket_t::impl::~impl() {
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        g_pending_sockets.erase(this);
+    }
 #ifdef GGML_RPC_RDMA
     rdma.reset();
 #endif // GGML_RPC_RDMA
@@ -438,28 +466,49 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
 }
 
 bool socket_t::impl::rdma_recv(void * data, size_t size) {
+    // Stream semantics over the message-based transport: an incoming message may span multiple
+    // recv_data calls (batched sends coalesce many commands into one message), so excess bytes
+    // are staged in rx_pending for the next call.
     rdma_conn * c = rdma.get();
     uint8_t * dst = (uint8_t *)data;
     size_t rem = size;
     while (rem > 0) {
+        if (rx_off < rx_pending.size()) {
+            const size_t avail = std::min(rem, rx_pending.size() - rx_off);
+            memcpy(dst, rx_pending.data() + rx_off, avail);
+            rx_off += avail;
+            dst += avail;
+            rem -= avail;
+            if (rx_off == rx_pending.size()) {
+                rx_pending.clear();
+                rx_off = 0;
+            }
+            continue;
+        }
+
         struct ibv_wc wc;
         if (!rdma_poll(c->rcq, &wc)) return false;
 
         int slot = (int)wc.wr_id;
         size_t got = wc.byte_len;
-        memcpy(dst, c->rx_slot(slot), got);
+        const size_t take = std::min(rem, got);
+        memcpy(dst, c->rx_slot(slot), take);
+        if (got > take) {
+            rx_pending.assign(c->rx_slot(slot) + take, c->rx_slot(slot) + got);
+            rx_off = 0;
+        }
 
         if (!c->post_rx(slot)) return false;
 
-        dst += got;
-        rem -= got;
+        dst += take;
+        rem -= take;
     }
     return true;
 }
 
 #endif // GGML_RPC_RDMA
 
-bool socket_t::impl::send_data(const void * data, size_t size) {
+bool socket_t::impl::send_data_raw(const void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
         return rdma_send(data, size);
@@ -479,7 +528,49 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
-bool socket_t::impl::recv_data(void * data, size_t size) {
+bool socket_t::impl::flush_send() {
+    if (send_buf.empty()) {
+        return true;
+    }
+    std::vector<uint8_t> buf;
+    buf.swap(send_buf);
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        g_pending_sockets.erase(this);
+    }
+    return send_data_raw(buf.data(), buf.size());
+}
+
+bool socket_t::impl::send_data_buffered(const void * data, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    const size_t threshold = rpc_batch_bytes();
+    if (threshold == 0 || size >= threshold) {
+        if (!flush_send()) {
+            return false;
+        }
+        return send_data_raw(data, size);
+    }
+    if (send_buf.empty()) {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        g_pending_sockets.insert(this);
+    }
+    send_buf.insert(send_buf.end(), (const uint8_t *) data, (const uint8_t *) data + size);
+    if (send_buf.size() >= threshold) {
+        return flush_send();
+    }
+    return true;
+}
+
+bool socket_t::impl::send_data(const void * data, size_t size) {
+    if (!flush_send()) {
+        return false;
+    }
+    return send_data_raw(data, size);
+}
+
+bool socket_t::impl::recv_data_raw(void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
         return rdma_recv(data, size);
@@ -501,6 +592,14 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         bytes_recv += (size_t)n;
     }
     return true;
+}
+
+bool socket_t::impl::recv_data(void * data, size_t size) {
+    // a command buffered on any socket can be a prerequisite for the data awaited here
+    if (!socket_t::flush_all_pending()) {
+        return false;
+    }
+    return recv_data_raw(data, size);
 }
 
 void socket_t::impl::get_caps(uint8_t * local_caps) {
@@ -554,6 +653,27 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+bool socket_t::send_data_buffered(const void * data, size_t size) {
+    return pimpl->send_data_buffered(data, size);
+}
+
+bool socket_t::flush_send() {
+    return pimpl->flush_send();
+}
+
+bool socket_t::flush_all_pending() {
+    std::vector<socket_t::impl *> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        pending.assign(g_pending_sockets.begin(), g_pending_sockets.end());
+    }
+    bool ok = true;
+    for (socket_t::impl * s : pending) {
+        ok = s->flush_send() && ok;
+    }
+    return ok;
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

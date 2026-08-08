@@ -341,13 +341,13 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+    if (!sock->send_data_buffered(&cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
+    if (!sock->send_data_buffered(&input_size, sizeof(input_size))) {
         return false;
     }
-    if (!sock->send_data(input, input_size)) {
+    if (!sock->send_data_buffered(input, input_size)) {
         return false;
     }
     return true;
@@ -1008,6 +1008,12 @@ private:
 
 
     // pairwise allreduce over a direct connection to the peer server
+    typedef size_t (*pair_comm_uid_size_t)(void);
+    typedef bool   (*pair_comm_get_uid_t)(void * uid);
+    typedef void * (*pair_comm_init_t)(ggml_backend_t backend, const void * uid, int rank, int n_ranks);
+    typedef bool   (*pair_comm_allreduce_t)(void * pair_comm, ggml_backend_t backend, void * data, int64_t ne);
+    typedef void   (*pair_comm_free_t)(void * pair_comm);
+
     struct comm_state {
         socket_ptr              peer;
         uint32_t                rank = 0;
@@ -1016,6 +1022,19 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+
+        // backend-native cross-process communicator (e.g. NCCL), negotiated lazily on first allreduce
+        void *                pair_comm       = nullptr;
+        bool                  pair_comm_tried = false;
+        pair_comm_allreduce_t pair_allreduce  = nullptr;
+        pair_comm_free_t      pair_free       = nullptr;
+
+        void release_pair_comm() {
+            if (pair_comm != nullptr && pair_free != nullptr) {
+                pair_free(pair_comm);
+            }
+            pair_comm = nullptr;
+        }
     };
 
     std::vector<ggml_backend_t> backends;
@@ -1850,6 +1869,60 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
+
+    // Prefer a backend-native cross-process communicator (NCCL): the collective is enqueued on the
+    // backend's stream, ordering naturally with graph computation - no host sync, no staging copies,
+    // no socket exchange. Negotiated once per comm; both ranks must agree (capability handshake) or
+    // everything stays on the socket path.
+    if (!state.pair_comm_tried && state.world == 2) {
+        state.pair_comm_tried = true;
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto p_uid_size  = (pair_comm_uid_size_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_pair_comm_uid_size");
+        auto p_get_uid   = (pair_comm_get_uid_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_pair_comm_get_uid");
+        auto p_init      = (pair_comm_init_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_pair_comm_init");
+        auto p_allreduce = (pair_comm_allreduce_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pair_comm_allreduce");
+        auto p_free      = (pair_comm_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_pair_comm_free");
+
+        const char * env = getenv("GGML_RPC_ALLREDUCE");
+        const bool env_ok = env == nullptr || strcmp(env, "socket") != 0;
+
+        uint8_t ok_local = env_ok && p_uid_size != nullptr && p_get_uid != nullptr && p_init != nullptr &&
+                           p_allreduce != nullptr && p_free != nullptr && p_uid_size() > 0;
+        uint8_t ok_peer = 0;
+        bool handshake_ok;
+        if (state.rank == 0) {
+            handshake_ok = state.peer->send_data(&ok_local, 1) && state.peer->recv_data(&ok_peer, 1);
+        } else {
+            handshake_ok = state.peer->recv_data(&ok_peer, 1) && state.peer->send_data(&ok_local, 1);
+        }
+        if (handshake_ok && ok_local && ok_peer) {
+            std::vector<uint8_t> uid(p_uid_size());
+            bool uid_ok;
+            if (state.rank == 0) {
+                uid_ok = p_get_uid(uid.data()) && state.peer->send_data(uid.data(), uid.size());
+            } else {
+                uid_ok = state.peer->recv_data(uid.data(), uid.size());
+            }
+            if (uid_ok) {
+                state.pair_comm = p_init(backend, uid.data(), (int) state.rank, (int) state.world);
+            }
+            if (state.pair_comm != nullptr) {
+                state.pair_allreduce = p_allreduce;
+                state.pair_free      = p_free;
+                GGML_LOG_INFO("[%s] backend-native pair communicator enabled (rank %u)\n", __func__, state.rank);
+            } else {
+                GGML_LOG_WARN("[%s] pair communicator init failed, using socket allreduce\n", __func__);
+            }
+        }
+    }
+
+    if (state.pair_comm != nullptr && t_dst->type == GGML_TYPE_F32) {
+        if (state.pair_allreduce(state.pair_comm, backend, t_dst->data, ne)) {
+            return true;
+        }
+    }
+
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
     const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
@@ -1945,6 +2018,7 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
+    comm_states[request.device].release_pair_comm();
     comm_states[request.device] = comm_state();
     return true;
 }
@@ -1964,6 +2038,9 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    for (auto & state : comm_states) {
+        state.release_pair_comm();
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }

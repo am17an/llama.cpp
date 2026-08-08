@@ -1254,6 +1254,98 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// Cross-process pairwise communicator (NCCL): ranks live in separate processes (e.g. two RPC
+// servers on different hosts) and bootstrap with an externally-exchanged ncclUniqueId.
+// Collectives are enqueued on the backend's own stream, so they order naturally with graph
+// computation - the caller needs no host synchronization around them.
+struct ggml_backend_cuda_pair_comm {
+#ifdef GGML_USE_NCCL
+    ncclComm_t comm = nullptr;
+#endif // GGML_USE_NCCL
+};
+
+static size_t ggml_backend_cuda_pair_comm_uid_size(void) {
+#ifdef GGML_USE_NCCL
+    return sizeof(ncclUniqueId);
+#else
+    return 0;
+#endif // GGML_USE_NCCL
+}
+
+static bool ggml_backend_cuda_pair_comm_get_uid(void * uid) {
+#ifdef GGML_USE_NCCL
+    return ncclGetUniqueId((ncclUniqueId *) uid) == ncclSuccess;
+#else
+    GGML_UNUSED(uid);
+    return false;
+#endif // GGML_USE_NCCL
+}
+
+static void * ggml_backend_cuda_pair_comm_init(ggml_backend_t backend, const void * uid, int rank, int n_ranks) {
+#ifdef GGML_USE_NCCL
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ncclUniqueId id;
+    memcpy(&id, uid, sizeof(id));
+    ncclComm_t comm = nullptr;
+    const ncclResult_t rc = ncclCommInitRank(&comm, n_ranks, id, rank);
+    if (rc != ncclSuccess) {
+        GGML_LOG_WARN("%s: ncclCommInitRank failed: %s\n", __func__, ncclGetErrorString(rc));
+        return nullptr;
+    }
+    auto * ret = new ggml_backend_cuda_pair_comm;
+    ret->comm = comm;
+    return ret;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(uid);
+    GGML_UNUSED(rank);
+    GGML_UNUSED(n_ranks);
+    return nullptr;
+#endif // GGML_USE_NCCL
+}
+
+static bool ggml_backend_cuda_pair_comm_allreduce(void * pair_comm_v, ggml_backend_t backend, void * data, int64_t ne) {
+#ifdef GGML_USE_NCCL
+    if (pair_comm_v == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * pc = static_cast<ggml_backend_cuda_pair_comm *>(pair_comm_v);
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const ncclResult_t rc = ncclAllReduce(data, data, (size_t) ne, ncclFloat, ncclSum, pc->comm, cuda_ctx->stream());
+    if (rc != ncclSuccess) {
+        GGML_LOG_WARN("%s: ncclAllReduce failed: %s\n", __func__, ncclGetErrorString(rc));
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(pair_comm_v);
+    GGML_UNUSED(backend);
+    GGML_UNUSED(data);
+    GGML_UNUSED(ne);
+    return false;
+#endif // GGML_USE_NCCL
+}
+
+static void ggml_backend_cuda_pair_comm_free(void * pair_comm_v) {
+#ifdef GGML_USE_NCCL
+    if (pair_comm_v == nullptr) {
+        return;
+    }
+    auto * pc = static_cast<ggml_backend_cuda_pair_comm *>(pair_comm_v);
+    if (pc->comm != nullptr) {
+        NCCL_CHECK(ncclCommDestroy(pc->comm));
+    }
+    delete pc;
+#else
+    GGML_UNUSED(pair_comm_v);
+#endif // GGML_USE_NCCL
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -5340,6 +5432,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_pair_comm_uid_size") == 0) {
+        return (void *)ggml_backend_cuda_pair_comm_uid_size;
+    }
+    if (strcmp(name, "ggml_backend_pair_comm_get_uid") == 0) {
+        return (void *)ggml_backend_cuda_pair_comm_get_uid;
+    }
+    if (strcmp(name, "ggml_backend_pair_comm_init") == 0) {
+        return (void *)ggml_backend_cuda_pair_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_pair_comm_allreduce") == 0) {
+        return (void *)ggml_backend_cuda_pair_comm_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_pair_comm_free") == 0) {
+        return (void *)ggml_backend_cuda_pair_comm_free;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
