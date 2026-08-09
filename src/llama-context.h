@@ -364,7 +364,25 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    llm_graph_result_ptr gf_res_prev;
+    // MRU-ordered ring of recent graph results; multiple slots let alternating graph shapes on one
+    // context (e.g. spec-decode encoder/inject/draft) each reuse their own previous graph.
+    // Grows on demand up to gf_res_cache_cap (env: LLAMA_GRAPH_REUSE_SLOTS).
+    struct gf_res_slot {
+        llm_graph_result_ptr res;
+        // node src pointers as built: ggml_backend_sched_split_graph rewires cross-split srcs to
+        // scheduler-owned copy tensors that die on the next split, so re-allocating a cached graph
+        // requires restoring the original srcs first
+        std::vector<ggml_tensor *> srcs;
+    };
+    std::vector<gf_res_slot> gf_res_cache;
+    llm_graph_result *       gf_res_bound     = nullptr; // slot the scheduler is currently allocated for
+    size_t                   gf_res_cache_cap = 1;
+    size_t                   gf_res_max_nodes = 0;
+    std::vector<size_t>      gf_res_buf_sizes;           // compute buffer sizes, to detect reallocation
+
+    // drop all cached graph results (scheduler reset / compute buffer reallocation)
+    void gf_res_cache_invalidate();
+
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

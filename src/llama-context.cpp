@@ -602,7 +602,22 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_max_nodes = max_nodes;
+    // the meta backend registers compute tensors in two ping-pong containers, which supports exactly
+    // the alternating rebuilds of a single-slot cache - re-binding an older slot would resolve against
+    // recycled containers, so meta-backed models keep the legacy single slot
+    bool model_on_meta = false;
+    for (const auto & d : model.devices) {
+        model_on_meta = model_on_meta || d.is_meta;
+    }
+    gf_res_cache_cap = model_on_meta ? 1 : 8;
+    if (const char * env = getenv("LLAMA_GRAPH_REUSE_SLOTS")) {
+        const int n = atoi(env);
+        gf_res_cache_cap = n > 1 ? (size_t) n : 1;
+    }
+    if (graph_reuse_disable) {
+        gf_res_cache_cap = 1;
+    }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -809,10 +824,10 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph result to make sure that it won't be reused
+        // reset the previous graph results to make sure they won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
-        //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        //       reset the graph results only if the memory module did reset the scheduler
+        gf_res_cache_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1326,6 +1341,13 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::gf_res_cache_invalidate() {
+    // drop the slots entirely: a reset result would still be probed by can_reuse and could match
+    // vacuously on its stale parameters
+    gf_res_cache.clear();
+    gf_res_bound = nullptr;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1333,14 +1355,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    // in order to correctly reuse a graph, its full topology has to be uniquely determined by the
+    // graph parameters. probe the cached results MRU-first - with alternating graph shapes on one
+    // context each shape reuses its own previous instance.
+    llm_graph_result * res      = nullptr;
+    gf_res_slot *      res_slot = nullptr;
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    if (!graph_reuse_disable) {
+        for (size_t i = 0; i < gf_res_cache.size(); i++) {
+            auto * cand = gf_res_cache[i].res.get();
+            const auto gparams = graph_params(cand, ubatch, mctx, gtype);
+            if (cand->can_reuse(gparams)) {
+                res = cand;
+                if (i > 0) {
+                    auto tmp = std::move(gf_res_cache[i]);
+                    gf_res_cache.erase(gf_res_cache.begin() + i);
+                    gf_res_cache.insert(gf_res_cache.begin(), std::move(tmp));
+                }
+                res_slot = &gf_res_cache.front();
+                break;
+            }
+        }
+    }
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (res != nullptr) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1350,16 +1388,56 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        if (res != gf_res_bound) {
+            // the scheduler computes the splits of the graph it was last allocated with - re-bind it to
+            // this slot's graph. the previous split rewired cross-split srcs to now-dead scheduler-owned
+            // copies, so restore the original srcs first. the slot's own tensors are still allocated, so
+            // the re-split leaves their data pointers intact.
+            ggml_cgraph * gf = res->get_gf();
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            GGML_ASSERT(res_slot->srcs.size() == (size_t) n_nodes*GGML_MAX_SRC);
+            for (int i = 0; i < n_nodes; i++) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    node->src[j] = res_slot->srcs[i*GGML_MAX_SRC + j];
+                }
+            }
+
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to re-bind reused graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            gf_res_bound = res;
+        }
+
         n_reused++;
     } else {
+        if (gf_res_cache.empty() || (!graph_reuse_disable && gf_res_cache.size() < gf_res_cache_cap)) {
+            gf_res_cache.insert(gf_res_cache.begin(), {llm_graph_result_ptr(new llm_graph_result(gf_res_max_nodes)), {}});
+        } else {
+            auto tmp = std::move(gf_res_cache.back());
+            gf_res_cache.pop_back();
+            gf_res_cache.insert(gf_res_cache.begin(), std::move(tmp));
+        }
+        res_slot = &gf_res_cache.front();
+        res = res_slot->res.get();
+        if (gf_res_bound == res) {
+            gf_res_bound = nullptr;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+        const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        auto * gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1369,10 +1447,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // snapshot the srcs before ggml_backend_sched_split_graph rewires them (see gf_res_slot)
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        res_slot->srcs.resize((size_t) n_nodes*GGML_MAX_SRC);
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                res_slot->srcs[i*GGML_MAX_SRC + j] = node->src[j];
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        gf_res_bound = res;
+
+        // allocating a graph that needs a larger compute buffer reallocates the buffer, which strands
+        // the tensors of every other cached result - detect the reallocation and drop them
+        bool buf_changed = gf_res_buf_sizes.size() != backend_ptrs.size();
+        gf_res_buf_sizes.resize(backend_ptrs.size());
+        for (size_t i = 0; i < backend_ptrs.size(); i++) {
+            const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            if (gf_res_buf_sizes[i] != sz) {
+                gf_res_buf_sizes[i] = sz;
+                buf_changed = true;
+            }
+        }
+        if (buf_changed) {
+            // drop every other slot: their tensors are stranded in the reallocated buffer
+            for (size_t i = gf_res_cache.size(); i-- > 0; ) {
+                if (gf_res_cache[i].res.get() != res) {
+                    gf_res_cache.erase(gf_res_cache.begin() + i);
+                }
+            }
         }
     }
 
@@ -2390,8 +2499,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
 
-    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    // when the scheduler is reset, we cannot reuse the old graphs, so we reset the cached graph results to prevent that
+    gf_res_cache_invalidate();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3391,7 +3500,10 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            // borrow a fresh graph result as scratch; nothing built here is reusable for inference
+            gf_res_cache_invalidate();
+            gf_res_cache.push_back({llm_graph_result_ptr(new llm_graph_result(gf_res_max_nodes)), {}});
+            auto * res = gf_res_cache.front().res.get();
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
