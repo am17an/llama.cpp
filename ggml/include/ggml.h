@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2639,6 +2640,29 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the full hyper-connection prologue in one op.
+    //   x    [n_embd, hc, n_tokens] - the hc state
+    //   dots [(2 + hc)*hc, n_tokens] - hc_fn @ flat(x), UNnormalized
+    //   scale [>= 3], base [(2 + hc)*hc]
+    // Internally: rs = rsqrt(mean(flat(x)^2) + rms_eps); mixes = dots*rs (equivalent to
+    // hc_fn @ rms_norm(flat(x)) with the normalization factored out of the dot products), then
+    //   pre[h]  = sigmoid(mixes[h]*scale[0] + base[h]) + hc_eps
+    //   post[h] = 2*sigmoid(mixes[hc + h]*scale[1] + base[hc + h])
+    //   comb    = sinkhorn(mixes[2*hc ..]*scale[2] + base[2*hc ..])  (as in ggml_dsv4_hc_comb)
+    // -> [n_embd + hc + hc*hc, n_tokens]:
+    //   rows [0, n_embd)                 : sum_h pre[h]*x[:, h, t]   (the hc_pre output)
+    //   rows [n_embd, n_embd + hc)       : post
+    //   rows [n_embd + hc, ...)          : comb, laid out dst + hc*src
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dots,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 rms_eps,
+            float                 hc_eps,
+            int32_t               n_iter);
 
     // custom operators
 

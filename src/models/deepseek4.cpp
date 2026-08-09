@@ -362,6 +362,30 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     GGML_ASSERT(hc == 4);
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
+    if (cparams.fused_dsv4_hc_mix) {
+        // the rms normalization factors out of the dot products: hc_fn @ rms_norm(flat) == (hc_fn @ flat)*rs,
+        // so the matvec runs on the raw state and one fused op does the rest of the hc prologue
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
+        ggml_tensor * dots = ggml_mul_mat(ctx0, hc_fn, flat);
+        cb(dots, "hc_dots", il);
+
+        ggml_tensor * mix = ggml_dsv4_hc_mix(ctx0, x, dots, hc_scale, hc_base,
+                norm_rms_eps, hparams.dsv4_hc_eps, (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, mix, il});
+
+        ggml_tensor * result = ggml_view_2d(ctx0, mix, n_embd, nt, mix->nb[1], 0);
+        cb(result, "hc_pre_mixed", il);
+
+        *post = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], n_embd*ggml_element_size(mix));
+        cb(*post, "hc_post", il);
+
+        *comb = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*ggml_element_size(mix), mix->nb[1],
+                (n_embd + hc)*ggml_element_size(mix));
+        cb(*comb, "hc_comb", il);
+
+        return result;
+    }
+
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
