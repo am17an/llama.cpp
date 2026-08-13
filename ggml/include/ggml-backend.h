@@ -156,6 +156,8 @@ extern "C" {
         bool events;
         // dedicated copy stream for compute/transfer overlap
         bool copy_stream;
+        // mmap is supported for loading
+        bool mmap_support;
     };
 
     // all the device properties
