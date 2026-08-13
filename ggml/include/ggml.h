@@ -627,6 +627,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1365,6 +1366,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 alpha,
+            float                 limit);
+
+    // silu(min(a, limit)) * clamp(b, -limit, limit)
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 limit);
 
     // normalize along rows
