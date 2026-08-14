@@ -764,6 +764,7 @@ static void ggml_backend_openvino_device_get_props(ggml_backend_dev_t dev, ggml_
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .copy_stream           = */ false,
+        /* .mmap_support          = */ true,
     };
 }
 
