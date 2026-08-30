@@ -383,6 +383,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
+static inline void rpc_cpu_relax() {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    __asm__ volatile("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
@@ -431,6 +439,16 @@ public:
         return true;
     }
 
+    bool try_pop(T* out) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (interrupted || queue.empty()) {
+            return false;
+        }
+        *out = queue.front();
+        queue.pop();
+        return true;
+    }
+
     void interrupt() {
         std::unique_lock<std::mutex> lock(mutex);
         interrupted = true;
@@ -460,6 +478,8 @@ public:
     void event_synchronize(ggml_backend_event_t event);
     void event_record(ggml_backend_event_t event);
     void synchronize();
+    void busy_spin_acquire();
+    void busy_spin_release();
 
     void start(const std::string & endpoint);
     void work();
@@ -483,6 +503,7 @@ private:
     };
     rpc_msg_queue    queue;
     socket_ptr       sock;
+    std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
 };
@@ -574,6 +595,15 @@ void rpc_dispatcher::synchronize() {
     msg->completion.get_future().wait();
 }
 
+void rpc_dispatcher::busy_spin_acquire() {
+    busy_spin_users.fetch_add(1, std::memory_order_relaxed);
+}
+
+void rpc_dispatcher::busy_spin_release() {
+    const unsigned previous = busy_spin_users.fetch_sub(1, std::memory_order_relaxed);
+    GGML_ASSERT(previous > 0);
+}
+
 void rpc_dispatcher::start(const std::string & endpoint) {
     std::string host;
     int port;
@@ -599,7 +629,12 @@ void rpc_dispatcher::start(const std::string & endpoint) {
 void rpc_dispatcher::work() {
     while (running) {
         rpc_msg_ptr msg_ptr;
-        if (!queue.pop(&msg_ptr)) {
+        if (busy_spin_users.load(std::memory_order_relaxed) != 0) {
+            if (!queue.try_pop(&msg_ptr)) {
+                rpc_cpu_relax();
+                continue;
+            }
+        } else if (!queue.pop(&msg_ptr)) {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
@@ -2792,6 +2827,7 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
         auto request = std::make_shared<rpc_msg_comm_free_req>();
         request->device = rank.device;
         rank.dispatcher->send(RPC_CMD_COMM_FREE, request, sizeof(*request));
+        rank.dispatcher->busy_spin_release();
     }
     delete comm_ctx;
 }
@@ -2830,6 +2866,10 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
 
+    for (const auto & rank : ranks) {
+        rank.dispatcher->busy_spin_acquire();
+    }
+
     // Send all init requests before reading any response: rank 0 blocks in accept
     // until rank 1 has connected.
     std::vector<rpc_msg_comm_init_rsp> responses(n_backends);
@@ -2855,6 +2895,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
     }
     if (!ok) {
+        for (const auto & rank : ranks) {
+            rank.dispatcher->busy_spin_release();
+        }
         return nullptr;
     }
     GGML_LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
