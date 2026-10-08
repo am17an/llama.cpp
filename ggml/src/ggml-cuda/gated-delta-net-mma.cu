@@ -63,9 +63,9 @@ using acc    = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
 using a_tile = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
 using b_tile = a_tile;
 #else
-using acc    = tile<16, 8, float>;
+using acc    = tile<16, 16, float>;
 using a_tile = tile<16, 8, nv_bfloat162>;
-using b_tile = tile<8, 8, nv_bfloat162>;
+using b_tile = a_tile;
 #endif // GGML_USE_HIP
 
 template <class tile_t, bool TRANS, int R, int C>
@@ -127,11 +127,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
     constexpr int WARPS = 8;
-#ifdef GGML_USE_HIP
     constexpr int N = 16;
-#else
-    constexpr int N = 8;
-#endif // GGML_USE_HIP
     static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
     extern __shared__ __align__(128) unsigned char bytes[];
     auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
