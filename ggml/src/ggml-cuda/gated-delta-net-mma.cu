@@ -229,14 +229,23 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         }
         // V32 overlaps Gram work with one output tile per projection warp.
         constexpr bool SPLIT_PROJECTION = C == 16 && V == 32;
-        acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
+        constexpr int  OUTPUT_TILES = (C / 16) * (V / N);
+        constexpr int  OUTPUT_STEP = SPLIT_PROJECTION ? 4 : WARPS;
+        constexpr int  OUTPUT_SLOTS = (OUTPUT_TILES + OUTPUT_STEP - 1) / OUTPUT_STEP;
+        const int      output_start = SPLIT_PROJECTION ? warp - 4 : warp;
+        acc            base_output[OUTPUT_SLOTS];
         auto           project = [&]() {
-            if constexpr (V == 32) {
+            if constexpr (SPLIT_PROJECTION) {
                 if (warp < 4) {
                     return;
                 }
             }
-            for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
+#pragma unroll
+            for (int slot = 0; slot < OUTPUT_SLOTS; ++slot) {
+                const int ti = output_start + slot * OUTPUT_STEP;
+                if (ti >= OUTPUT_TILES) {
+                    continue;
+                }
                 const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
                 acc       qs, ks;
                 product<D, false, true>(qs, s.q, s.scratch.state, r, c);
@@ -247,7 +256,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                     const float decay = expf(s.prefix[t]);
                     const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
                     s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
-                    base_output[ti / WARPS].x[i] = decay * qs.x[i];
+                    base_output[slot].x[i] = decay * qs.x[i];
                 }
             }
         };
@@ -312,8 +321,12 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             store(s.scratch.solved, x, r, c);
         }
         __syncthreads();
-        for (int ti = (SPLIT_PROJECTION ? warp - 4 : warp); ti < (C / 16) * (V / N) && (!SPLIT_PROJECTION || warp >= 4);
-             ti += WARPS) {
+#pragma unroll
+        for (int slot = 0; slot < OUTPUT_SLOTS; ++slot) {
+            const int ti = output_start + slot * OUTPUT_STEP;
+            if (ti >= OUTPUT_TILES || (SPLIT_PROJECTION && warp < 4)) {
+                continue;
+            }
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
             product<C, false, true>(x, s.p, s.scratch.solved, r, c);
@@ -321,7 +334,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             for (int i = 0; i < acc::ne; ++i) {
                 const int t = r + acc::get_i(i), v = c + acc::get_j(i);
                 if (t < valid) {
-                    out[(t0 + t) * a.H * D + v] = base_output[ti / WARPS].x[i] + x.x[i];
+                    out[(t0 + t) * a.H * D + v] = base_output[slot].x[i] + x.x[i];
                 }
             }
         }
