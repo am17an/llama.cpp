@@ -140,6 +140,11 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     const int64_t                                  qoff  = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
     const int64_t                                  voff  = seq * a.sv3 + h * a.sv1 + v0;
     const int64_t                                  goff  = seq * a.sb3 + h * a.sb1;
+    const float * const                            g_base         = a.g + goff;
+    const float * const                            beta_base      = a.beta + goff;
+    const float * const                            v_base         = a.v + voff;
+    const float * const                            state_base     = a.state + soff;
+    float * const                                  state_out_base = a.state_out + soff;
     float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
     constexpr int                                  STATE_TILES = (D / 16) * (V / N);
     constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
@@ -150,7 +155,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         const int tile_index = warp + j * WARPS, r = (tile_index / (V / N)) * 16, c = (tile_index % (V / N)) * N;
 #pragma unroll
         for (int i = 0; i < acc::ne; ++i) {
-            state[j].x[i] = a.state[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)];
+            state[j].x[i] = state_base[(v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)];
         }
     }
     auto read_qk = [&](int64_t t, float4 & q, float4 & k) {
@@ -195,8 +200,8 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             float carry = 0.f;
             for (int base = 0; base < C; base += 32) {
                 const int   t    = base + lane;
-                float       g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
-                const float beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+                float       g    = t < valid ? g_base[(t0 + t) * a.sb2] : 0.f;
+                const float beta = t < valid ? beta_base[(t0 + t) * a.sb2] : 0.f;
 #pragma unroll
                 for (int offset = 1; offset < 32; offset *= 2) {
                     const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
@@ -250,7 +255,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 for (int i = 0; i < acc::ne; ++i) {
                     const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
                     const float decay = expf(s.prefix[t]);
-                    const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
+                    const float vv    = t < valid ? v_base[(t0 + t) * a.sv2 + v] : 0.f;
                     s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
                     base_output[slot].x[i] = decay * qs.x[i];
                 }
@@ -357,7 +362,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
 #pragma unroll
         for (int i = 0; i < acc::ne; ++i) {
-            a.state_out[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)] = state[j].x[i];
+            state_out_base[(v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)] = state[j].x[i];
         }
     }
 #else
