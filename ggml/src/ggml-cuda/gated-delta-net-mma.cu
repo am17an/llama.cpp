@@ -33,6 +33,24 @@ template <int R, int C> struct matrix {
 #endif // GGML_USE_MUSA
     }
 
+    __device__ __forceinline__ void store4(int r, int c, float4 x) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        store2(r, c, make_float2(x.x, x.y));
+        store2(r, c + 2, make_float2(x.z, x.w));
+#else
+        static_assert(C % 4 == 0, "store4 needs aligned rows");
+        const int    i  = index(r, c);
+        const auto   h0 = __float22bfloat162_rn(make_float2(x.x, x.y));
+        const auto   h1 = __float22bfloat162_rn(make_float2(x.z, x.w));
+        const float2 r0 = __bfloat1622float2(h0);
+        const float2 r1 = __bfloat1622float2(h1);
+        const auto   l0 = __float22bfloat162_rn(make_float2(x.x - r0.x, x.y - r0.y));
+        const auto   l1 = __float22bfloat162_rn(make_float2(x.z - r1.x, x.w - r1.y));
+        *reinterpret_cast<uint2 *>(hi + i) = make_uint2(reinterpret_cast<const uint32_t &>(h0), reinterpret_cast<const uint32_t &>(h1));
+        *reinterpret_cast<uint2 *>(lo + i) = make_uint2(reinterpret_cast<const uint32_t &>(l0), reinterpret_cast<const uint32_t &>(l1));
+#endif // GGML_USE_HIP || GGML_USE_MUSA
+    }
+
     __device__ __forceinline__ void store(int r, int c, float x) {
         const int  i = index(r, c);
         const bf16 h = __float2bfloat16(x);
@@ -190,10 +208,8 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             } else {
                 read_qk(t0 + 8 * j, q, k);
             }
-            s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
-            s.q.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
-            s.k.store2(t, d, make_float2(k.x, k.y));
-            s.k.store2(t, d + 2, make_float2(k.z, k.w));
+            s.q.store4(t, d, make_float4(q.x * a.scale, q.y * a.scale, q.z * a.scale, q.w * a.scale));
+            s.k.store4(t, d, k);
         }
         // Load gates in parallel before the FP32 prefix scan.
         if (warp == 0) {
