@@ -199,7 +199,6 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     const float * const                            beta_base      = a.beta + goff;
     const float * const                            v_base         = a.v + voff;
     const float * const                            state_base     = a.state + soff;
-    float * const                                  state_out_base = a.state_out + soff;
     float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
     constexpr int                                  STATE_TILES = (D / 16) * (V / N);
     constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
@@ -429,6 +428,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         }
         __syncthreads();
     }
+    float * const state_out_base = a.state_out + (int64_t) (blockIdx.x / (D / V)) * D * D;
 #pragma unroll
     for (int j = 0; j < PER_WARP; ++j) {
         const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
