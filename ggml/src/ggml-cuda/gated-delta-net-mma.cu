@@ -138,6 +138,29 @@ __device__ __forceinline__ void product(acc & c, const matrix<AR, AC> & a, const
     }
 }
 
+#ifndef GGML_USE_HIP
+template <bool FULL, bool ALIGNED>
+__device__ __forceinline__ acc load_values(const float * base, int64_t stride, int64_t t0, int row, int col, int valid) {
+    acc values;
+#pragma unroll
+    for (int i = 0; i < acc::ne; i += 2) {
+        const int t = row + acc::get_i(i), v = col + acc::get_j(i);
+        float2 vv = make_float2(0.f, 0.f);
+        if (FULL || t < valid) {
+            const float * p = base + (t0 + t) * stride + v;
+            if constexpr (ALIGNED) {
+                vv = *reinterpret_cast<const float2 *>(p);
+            } else {
+                vv = make_float2(p[0], p[1]);
+            }
+        }
+        values.x[i] = vv.x;
+        values.x[i + 1] = vv.y;
+    }
+    return values;
+}
+#endif // GGML_USE_HIP
+
 template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, const acc & x, int r, int c) {
 #pragma unroll
 #ifdef GGML_USE_HIP
@@ -278,12 +301,33 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
                 acc       qs, ks;
                 product<D, false, true>(qs, s.q, s.scratch.state, r, c);
+#ifndef GGML_USE_HIP
+                auto read_v = [&]() {
+                    return valid == C ? load_values<true, ALIGNED>(v_base, a.sv2, t0, r, c, valid) :
+                                        load_values<false, ALIGNED>(v_base, a.sv2, t0, r, c, valid);
+                };
+                acc values;
+                // Prefetch V for whole heads; value-split blocks need a shorter register lifetime.
+                constexpr bool PREFETCH_V = V == 128 && ALIGNED;
+                if constexpr (PREFETCH_V) {
+                    values = read_v();
+                }
+#endif // GGML_USE_HIP
                 product<D, false, true>(ks, s.k, s.scratch.state, r, c);
+#ifndef GGML_USE_HIP
+                if constexpr (!PREFETCH_V) {
+                    values = read_v();
+                }
+#endif // GGML_USE_HIP
 #pragma unroll
                 for (int i = 0; i < acc::ne; ++i) {
                     const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
                     const float decay = expf(s.prefix[t]);
-                    const float vv    = t < valid ? v_base[(t0 + t) * a.sv2 + v] : 0.f;
+#ifdef GGML_USE_HIP
+                    const float vv = t < valid ? v_base[(t0 + t) * a.sv2 + v] : 0.f;
+#else
+                    const float vv = values.x[i];
+#endif // GGML_USE_HIP
                     s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
                     base_output[slot].x[i] = decay * qs.x[i];
                 }
@@ -480,6 +524,7 @@ static bool launch_gdn_mma(int device, const ggml_cuda_gdn_mma_args & a, cudaStr
 }  // namespace
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
-    const bool aligned = (((uintptr_t) a.q | (uintptr_t) a.k) & 31) == 0 && ((a.sq1 | a.sq2 | a.sq3) & 7) == 0;
+    const bool aligned = (((uintptr_t) a.q | (uintptr_t) a.k) & 31) == 0 && ((a.sq1 | a.sq2 | a.sq3) & 7) == 0 &&
+                         ((uintptr_t) a.v & 7) == 0 && ((a.sv1 | a.sv2 | a.sv3) & 1) == 0;
     return aligned ? launch_gdn_mma<true>(device, a, stream) : launch_gdn_mma<false>(device, a, stream);
 }
