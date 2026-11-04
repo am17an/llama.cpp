@@ -410,6 +410,121 @@ struct case_rollback_bound : ctx_test {
     }
 };
 
+// a seq verifies a draft in one ubatch, then a later ubatch of the same batch moves its cell to make the cells
+// of the other seqs contiguous: the rollback snapshots and their bound must follow the cell. This is the
+// speculative decoding pattern of llama-server, where drafts of different lengths split the batch.
+struct case_rollback_moved_cell : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_moved"; }
+
+    const char * description() const override {
+        return "a rollback after a later ubatch moved the cell of the seq, against a reference context";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "the batch has a multi-seq ubatch";
+        }
+
+        // the DSV4 cache keeps the rollback bound per seq and does not move cells
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
+            return "no recurrent cells to move";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix   = 16;
+        constexpr llama_pos n_verify   = 8; // the draft of seq 0
+        constexpr llama_pos n_other    = 4; // the drafts of seqs 1 and 2
+        constexpr llama_pos n_rollback = 3;
+        constexpr llama_pos p0         = n_prefix + n_verify - n_rollback;
+
+        for (const int kv_unified : { 0, 1 }) {
+            const auto make_ctx = [&]() {
+                ctx_opts opts;
+                opts.n_ctx      = 256;
+                opts.n_batch    = 64;
+                opts.n_ubatch   = 64;
+                opts.n_seq_max  = 3;
+                opts.n_rs_seq   = 8;
+                opts.kv_unified = kv_unified;
+                return mr.ctx(opts);
+            };
+
+            llama_context_ptr ctx_roll = make_ctx();
+            llama_context_ptr ctx_ref  = make_ctx();
+            if (!ctx_roll || !ctx_ref) {
+                return case_result::fail();
+            }
+
+            if (llama_n_rs_seq(ctx_roll.get()) < (uint32_t) n_verify) {
+                return case_result::skip("n_rs_seq is too small");
+            }
+
+            // prefill in the order 1, 0, 2 so that the recurrent cells hold seqs 1, 0, 2
+            bool ok = true;
+            for (const llama_seq_id s : { 1, 0, 2 }) {
+                ok = ok && decode_gen(ctx_roll.get(), n_vocab, s, 0, n_prefix);
+                ok = ok && decode_gen(ctx_ref.get(),  n_vocab, s, 0, n_prefix);
+            }
+            CTX_REQUIRE(ok, "the prefill failed");
+
+            // seq 0 has more tokens, so it gets its own ubatch first; the next ubatch holds seqs 1 and 2,
+            //   whose cells are made contiguous by moving the cell of seq 0
+            const auto decode_drafts = [&](llama_context * ctx, llama_pos n_seq0) {
+                common_batch batch(ctx);
+                for (llama_pos i = 0; i < n_seq0; ++i) {
+                    batch.add(gen_token(n_vocab, 0, n_prefix + i), n_prefix + i, 0, true);
+                }
+                for (const llama_seq_id s : { 1, 2 }) {
+                    for (llama_pos i = 0; i < n_other; ++i) {
+                        batch.add(gen_token(n_vocab, s, n_prefix + i), n_prefix + i, s, true);
+                    }
+                }
+                return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            };
+
+            ok = decode_drafts(ctx_roll.get(), n_verify) && decode_drafts(ctx_ref.get(), p0 - n_prefix);
+            CTX_REQUIRE(ok, "the draft decode failed");
+
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), 0, p0, -1),
+                    "the rollback of seq 0 after its cell was moved was refused (kv_unified = " + std::to_string(kv_unified) + ")");
+
+            ok = decode_one(ctx_roll.get(), gen_token(n_vocab, 0, p0), p0, 0) &&
+                 decode_one(ctx_ref.get(),  gen_token(n_vocab, 0, p0), p0, 0);
+            CTX_REQUIRE(ok, "the decode after the rollback failed");
+
+            const float * l_roll = llama_get_logits_ith(ctx_roll.get(), 0);
+            const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+            if (l_roll == nullptr || l_ref == nullptr) {
+                TLOG_ERR("%s: missing logits after the rollback\n", __func__);
+                return case_result::fail();
+            }
+
+            // the same bound as the replay case, the two contexts split their batches differently
+            constexpr float nmse_eps = 1e-4f;
+
+            const logits_diff diff = compare_logits(l_roll, l_ref, n_vocab);
+            CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                    "logits mismatch after the rollback of a moved cell (kv_unified = " + std::to_string(kv_unified) +
+                    ", max diff " + std::to_string(diff.diff_max) + ", nmse " + std::to_string(diff.nmse()) + ")");
+
+            TLOG_INF("%s: kv_unified = %d, rollback of a moved cell matched (max diff %g, nmse %g)\n",
+                    __func__, kv_unified, (double) diff.diff_max, diff.nmse());
+        }
+
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -493,6 +608,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
+    cases.push_back(std::make_unique<case_rollback_moved_cell>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
     return cases;

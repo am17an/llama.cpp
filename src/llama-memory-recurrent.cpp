@@ -646,6 +646,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // the rollback snapshots follow the cell (see llama_memory_recurrent_context::get_n_rs_snap)
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -1336,6 +1338,27 @@ uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_rs_snap(uint32_t n_seqs) const {
+    if (mem->n_rs_seq == 0) {
+        return 0;
+    }
+
+    // reserve for the worst case: a ubatch of a single seq has no extra cells, so at most size - 2 cells are extra
+    if (is_full) {
+        return (mem->size > 2 ? mem->size - 2 : 0)*mem->n_rs_seq;
+    }
+
+    // the extra cells (between head + n_seqs and head + n) can have been moved to make the cells of the ubatch
+    //   contiguous; if one of them still holds rollback snapshots, the snapshots of all extra cells are moved too
+    for (uint32_t i = n_seqs; i < mem->n; ++i) {
+        if (mem->cells[mem->head + i].rs_max > 0) {
+            return (mem->n - n_seqs)*mem->n_rs_seq;
+        }
+    }
+
+    return 0;
+}
+
 uint32_t llama_memory_recurrent_context::get_head() const {
     return is_full ? 0 : mem->head;
 }
@@ -1378,4 +1401,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::s_copy_snap(uint32_t n_seqs, int i) const {
+    const uint32_t n_extra  = mem->n - n_seqs;
+    const uint32_t cell_idx = mem->head + n_seqs + i % n_extra;
+
+    // snapshot k = 1 + i / n_extra of the extra cell, read from where the cell was before it was moved
+    return (int32_t)((1 + i / n_extra) * mem->size) + mem->cells[cell_idx].src0;
 }

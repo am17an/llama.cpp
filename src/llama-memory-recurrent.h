@@ -177,6 +177,8 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    // number of rollback snapshot rows moved with the extra cells of a ubatch of n_seqs sequences
+    uint32_t get_n_rs_snap(uint32_t n_seqs) const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
@@ -186,6 +188,7 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t s_copy_snap(uint32_t n_seqs, int i) const;
 
 private:
     const llama_memory_status status;

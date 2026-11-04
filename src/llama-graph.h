@@ -302,12 +302,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy;  // I32 [n_rs + n_rs_snap], see llama_memory_recurrent_context::get_n_rs_snap
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_tail; // I32 [n_rs + n_rs_snap - 1]
 
     // I32 [n_slot] = {n_slot - 1, ..., 0}, rollback slot of each conv window, created by the graphs that write them
     ggml_tensor * s_slot_rev = nullptr;
@@ -1422,6 +1422,7 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
+               uint32_t   n_rs_snap,
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
