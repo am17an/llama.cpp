@@ -1751,6 +1751,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+
+        // entries past the number of devices are silently dropped, which can put far more
+        // of the model on the remaining devices than intended (e.g. when the host CPU is
+        // assumed to be part of the split)
+        size_t n_ignored = 0;
+        for (size_t i = n_devices(); i < llama_max_devices(); ++i) {
+            n_ignored += tensor_split[i] != 0.0f;
+        }
+        if (n_ignored > 0) {
+            LLAMA_LOG_WARN("%s: tensor_split has %zu non-zero value(s) beyond the %zu device(s) in use, they will be ignored "
+                "(the CPU is not part of tensor_split, use n_gpu_layers to keep layers on the CPU)\n",
+                __func__, n_ignored, n_devices());
+        }
     }
 
     // sum and normalize the splits to get the split points
