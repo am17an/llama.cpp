@@ -18,6 +18,37 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+// check if the device can store rows into a cache tensor of the given type
+// the cache tensors are pre-allocated on the device, so the scheduler cannot move this op to another backend
+static bool llama_kv_dev_supports_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, ggml_type type) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create ggml context");
+    }
+
+    // 256 is a multiple of the block size of all supported cache types
+    ggml_tensor * dst  = ggml_new_tensor_2d(ctx.get(), type,          256, 1);
+    ggml_tensor * src  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 1);
+    ggml_tensor * idxs = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+
+    ggml_tensor * op = ggml_set_rows(ctx.get(), dst, src, idxs);
+
+    ggml_backend_buffer_ptr buf { ggml_backend_buft_alloc_buffer(buft, 0) };
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] != nullptr) {
+            op->src[i]->buffer = buf.get();
+        }
+    }
+
+    return ggml_backend_dev_supports_op(dev, op);
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -218,6 +249,15 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // note: MLA models do not have a V cache
+            for (ggml_type type : { type_k, is_mla ? type_k : type_v }) {
+                if (!llama_kv_dev_supports_type(dev, buft, type)) {
+                    throw std::runtime_error(format("KV cache type %s is not supported on device %s (layer %d), "
+                                "use a different cache type or disable KV offloading",
+                                ggml_type_name(type), dev_name, il));
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
