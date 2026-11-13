@@ -164,6 +164,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (op->ne[0] % (TILE_N * 2)) {
             return false;
         }
+        // the packed weight format holds a single 2D matrix
+        if (src0->type != GGML_TYPE_F16 && (src0->ne[2] != 1 || src0->ne[3] != 1)) {
+            return false;
+        }
         int alignment;
         switch (src0->type) {
             case GGML_TYPE_Q4_0:
