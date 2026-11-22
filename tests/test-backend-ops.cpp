@@ -3795,6 +3795,102 @@ struct test_add_id : public test_case {
     }
 };
 
+// GGML_OP_CUSTOM with kernels for the backends (ggml_custom_op_4d): the kernel of the backend against the CPU function
+struct test_custom_op_params {
+    float   a;
+    int32_t n;
+};
+
+static void test_custom_op_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const test_custom_op_params * p = (const test_custom_op_params *) userdata;
+
+    const float * x = (const float *) dst->src[0]->data;
+    const float * y = (const float *) dst->src[1]->data;
+    float       * d = (float *) dst->data;
+
+    for (int64_t i = (int64_t) p->n*ith/nth; i < (int64_t) p->n*(ith + 1)/nth; i++) {
+        d[i] = p->a*x[i] + y[i];
+    }
+}
+
+static const ggml_custom_op * test_custom_op_get() {
+    static const char * metal = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct test_custom_op_params {
+    float a;
+    int   n;
+};
+
+kernel void test_custom_op(
+        constant test_custom_op_params & p,
+        device       float * dst,
+        device const float * x,
+        device const float * y,
+        uint i [[thread_position_in_grid]]) {
+    if (i < (uint) p.n) {
+        dst[i] = p.a*x[i] + y[i];
+    }
+}
+)";
+
+    // test-backend-ops-custom.cu compiled to PTX
+    static std::string ptx;
+#ifdef TEST_CUSTOM_OP_PTX
+    {
+        std::ifstream file(TEST_CUSTOM_OP_PTX);
+        std::stringstream ss;
+        ss << file.rdbuf();
+        ptx = ss.str();
+    }
+#endif
+
+    static std::vector<ggml_custom_kernel> kernels;
+    kernels = { { "MTL", metal, 0, "test_custom_op" } };
+    if (!ptx.empty()) {
+        kernels.push_back({ "CUDA", ptx.c_str(), 0, "test_custom_op" });
+    }
+
+    static ggml_custom_op op;
+    op = { "test_custom_op", test_custom_op_cpu, kernels.data(), (int) kernels.size() };
+    return &op;
+}
+
+struct test_custom_op : public test_case {
+    const int64_t n;
+    const float a;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, a);
+    }
+
+    test_custom_op(int64_t n = 1000, float a = 2.0f)
+        : n(n), a(a) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        static const ggml_custom_op * op = test_custom_op_get();
+
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(y, "y");
+
+        ggml_tensor * args[] = { x, y };
+        const test_custom_op_params p = { a, (int32_t) n };
+        const ggml_custom_sched sched = {
+            /*.n_tasks    =*/ GGML_N_TASKS_MAX,
+            /*.n_groups   =*/ { (int) ((n + 255)/256), 1, 1 },
+            /*.group_size =*/ { 256, 1, 1 },
+        };
+        ggml_tensor * out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p), sched);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SCALE
 struct test_scale : public test_case {
     const ggml_type type;
@@ -11790,6 +11886,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {1, 2, 2, 2}, 7));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {2, 2, 2, 2}, 8));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+
+    for (int64_t n : { 1, 255, 1000, 100000 }) {
+        test_cases.emplace_back(new test_custom_op(n, 2.0f));
+    }
 
     test_cases.emplace_back(new test_scale());
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));

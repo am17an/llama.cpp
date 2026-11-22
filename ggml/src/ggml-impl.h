@@ -211,6 +211,12 @@ struct ggml_custom_op_params {
     ggml_custom_op_t fun;
     int              n_tasks;
     void           * userdata;
+
+    // ggml_custom_op_4d(): the op with its kernels, userdata is the copy of the params, NULL for the other custom ops
+    const struct ggml_custom_op * op;
+    uint32_t params_size;
+    uint32_t n_groups[3];
+    uint32_t group_size[3];
 };
 
 // bitset

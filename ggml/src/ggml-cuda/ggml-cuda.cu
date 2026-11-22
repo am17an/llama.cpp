@@ -75,6 +75,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/custom-op.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3162,6 +3163,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            ggml_cuda_op_custom(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -3373,6 +3377,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        ggml_cuda_custom_op_graph_props(&prop.node);
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
@@ -6827,6 +6832,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_custom_op_supported(dev_ctx->device, op);
         case GGML_OP_SLEEP:
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             return false;

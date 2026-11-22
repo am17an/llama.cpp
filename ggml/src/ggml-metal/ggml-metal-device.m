@@ -899,6 +899,8 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+#define GGML_METAL_MAX_CUSTOM_LIBS 64
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -918,6 +920,13 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // the libraries of the custom op kernels (see ggml_custom_op in ggml.h), one per source, NULL if it does not compile
+    int n_custom;
+    struct {
+        const void *         code;
+        ggml_metal_library_t lib;
+    } custom[GGML_METAL_MAX_CUSTOM_LIBS];
 };
 
 //
@@ -1382,6 +1391,11 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
         ggml_metal_library_free(dev->library);
         dev->library = NULL;
 
+        for (int i = 0; i < dev->n_custom; ++i) {
+            ggml_metal_library_free(dev->custom[i].lib);
+        }
+        dev->n_custom = 0;
+
         if (dev->mtl_queue) {
             [dev->mtl_queue release];
             dev->mtl_queue = nil;
@@ -1547,6 +1561,61 @@ static bool ggml_metal_supports_mul_mat_op(
     }
 
     return mm_path;
+}
+
+struct ggml_metal_pipeline_with_params ggml_metal_device_get_pipeline_custom(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    struct ggml_metal_pipeline_with_params res = {
+        /*.pipeline =*/ nil,
+        /*.nsg      =*/ 0,
+        /*.nr0      =*/ 0,
+        /*.nr1      =*/ 0,
+        /*.smem     =*/ 0,
+        /*.c4       =*/ false,
+        /*.cnt      =*/ false,
+    };
+
+    struct ggml_custom_op_params p;
+    memcpy(&p, op->op_params, sizeof(p));
+    if (op->op != GGML_OP_CUSTOM || p.op == NULL) {
+        return res;
+    }
+
+    const struct ggml_custom_kernel * k = NULL;
+    for (int i = 0; i < p.op->n_kernels && k == NULL; ++i) {
+        if (strcmp(p.op->kernels[i].backend, GGML_METAL_NAME) == 0 && p.op->kernels[i].code != NULL && p.op->kernels[i].name != NULL) {
+            k = &p.op->kernels[i];
+        }
+    }
+    if (k == NULL) {
+        return res;
+    }
+
+    // the source is compiled once
+    static NSLock * lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+
+    ggml_metal_library_t lib = NULL;
+    [lock lock];
+    int i = 0;
+    while (i < dev->n_custom && dev->custom[i].code != k->code) {
+        i++;
+    }
+    if (i == dev->n_custom && dev->n_custom < GGML_METAL_MAX_CUSTOM_LIBS) {
+        dev->custom[i].code = k->code;
+        dev->custom[i].lib  = ggml_metal_library_init_from_source(dev, (const char *) k->code, true);
+        dev->n_custom++;
+    }
+    if (i < dev->n_custom) {
+        lib = dev->custom[i].lib;
+    }
+    [lock unlock];
+
+    if (lib == NULL) {
+        return res;
+    }
+
+    return ggml_metal_library_compile_pipeline(lib, k->name, k->name, NULL);
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
@@ -1886,6 +1955,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
+        case GGML_OP_CUSTOM:
+            {
+                // a kernel for Metal that compiles, it gets the tensors as buffers
+                if (!ggml_is_contiguous(op)) {
+                    return false;
+                }
+                for (int i = 0; i < GGML_MAX_SRC && op->src[i] != NULL; ++i) {
+                    if (!ggml_is_contiguous(op->src[i])) {
+                        return false;
+                    }
+                }
+                return ggml_metal_device_get_pipeline_custom(dev, op).pipeline != nil;
+            }
         case GGML_OP_TOP_K_MASK:
             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                 op->src[0]->type == op->type &&

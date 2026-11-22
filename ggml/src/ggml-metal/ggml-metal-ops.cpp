@@ -349,6 +349,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_top_k_mask(ctx, idx);
             } break;
+        case GGML_OP_CUSTOM:
+            {
+                n_fuse = ggml_metal_op_custom(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -814,6 +818,32 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne11, ne12, ne13, nth, 1, 1);
+
+    return 1;
+}
+
+// a kernel of the user (see ggml_custom_op in ggml.h): the params at index 0, the node at 1, its arguments from 2
+int ggml_metal_op_custom(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    struct ggml_custom_op_params p;
+    memcpy(&p, op->op_params, sizeof(p));
+
+    auto pipeline = ggml_metal_device_get_pipeline_custom(ctx->dev, op);
+    GGML_ASSERT(pipeline.pipeline != nullptr);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    if (p.params_size > 0) {
+        ggml_metal_encoder_set_bytes(enc, p.userdata, p.params_size, 0);
+    }
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 1);
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i] != nullptr; ++i) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), 2 + i);
+    }
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, p.n_groups[0], p.n_groups[1], p.n_groups[2], p.group_size[0], p.group_size[1], p.group_size[2]);
 
     return 1;
 }

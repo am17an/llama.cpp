@@ -2608,6 +2608,54 @@ extern "C" {
             int                   n_tasks,
             void                * userdata);
 
+    // Custom operators that other backends than the CPU can run
+    //
+    // The CPU backend calls fun(dst, ith, nth, params), like ggml_custom_4d().
+    // A backend with a kernel in the list runs the node itself, with n_groups workgroups of group_size threads.
+    // The kernel gets the data of the node, the data of its arguments and the params of the node:
+    //
+    //   backend  code                kernel
+    //   "CUDA"   PTX (nvcc -ptx)     extern "C" __global__ void name(T * dst, const T0 * a0, ..., const P params)
+    //   "MTL"    Metal source        kernel void name(constant P & params, device T * dst, device const T0 * a0, ...)
+    //
+    // The backend names are those of ggml_backend_reg_name().
+    // The CPU backend also computes the node if the backend has no kernel, cannot load it, or the tensors are not contiguous.
+
+    struct ggml_custom_kernel {
+        const char * backend;
+        const void * code;
+        size_t       code_size; // 0: code is a string
+        const char * name;      // name of the kernel in the code
+    };
+
+    struct ggml_custom_op {
+        const char                      * name;
+        ggml_custom_op_t                  fun; // CPU
+        const struct ggml_custom_kernel * kernels;
+        int                               n_kernels;
+    };
+
+    struct ggml_custom_sched {
+        int n_tasks;       // CPU: number of threads, GGML_N_TASKS_MAX to use them all
+        int n_groups[3];   // kernels: number of workgroups
+        int group_size[3]; // kernels: threads of a workgroup
+    };
+
+    // op and what it points to must outlive the graph, params is copied
+    GGML_API struct ggml_tensor * ggml_custom_op_4d(
+            struct ggml_context         * ctx,
+            enum ggml_type                type,
+            int64_t                       ne0,
+            int64_t                       ne1,
+            int64_t                       ne2,
+            int64_t                       ne3,
+            struct ggml_tensor         ** args,
+            int                           n_args,
+            const struct ggml_custom_op * op,
+            const void                  * params,
+            size_t                        params_size,
+            struct ggml_custom_sched      sched);
+
     // Busy-wait operator for scheduling and backend testing.
     GGML_API struct ggml_tensor * ggml_sleep(
             struct ggml_context * ctx,

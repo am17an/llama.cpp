@@ -366,6 +366,21 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+# the CUDA kernel of test_custom_op is compiled to PTX, the test loads the file
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(TEST_CUSTOM_OP_PTX ${CMAKE_CURRENT_BINARY_DIR}/test-backend-ops-custom.ptx)
+    add_custom_command(
+        OUTPUT  ${TEST_CUSTOM_OP_PTX}
+        COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -ptx -o ${TEST_CUSTOM_OP_PTX} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-ops-custom.cu
+        DEPENDS test-backend-ops-custom.cu
+        VERBATIM
+    )
+    add_custom_target(test-backend-ops-ptx DEPENDS ${TEST_CUSTOM_OP_PTX})
+    add_dependencies(test-backend-ops test-backend-ops-ptx)
+    target_compile_definitions(test-backend-ops PRIVATE TEST_CUSTOM_OP_PTX="${TEST_CUSTOM_OP_PTX}")
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)

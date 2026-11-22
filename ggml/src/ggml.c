@@ -6159,11 +6159,62 @@ struct ggml_tensor * ggml_custom_4d(
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, ne0, ne1, ne2, ne3);
 
     struct ggml_custom_op_params params = {
-        /*.fun      =*/ fun,
-        /*.n_tasks  =*/ n_tasks,
-        /*.userdata =*/ userdata
+        /*.fun         =*/ fun,
+        /*.n_tasks     =*/ n_tasks,
+        /*.userdata    =*/ userdata,
+        /*.op          =*/ NULL,
+        /*.params_size =*/ 0,
+        /*.n_groups    =*/ { 0 },
+        /*.group_size  =*/ { 0 },
     };
     ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op = GGML_OP_CUSTOM;
+    for (int i = 0; i < n_args; i++) {
+        result->src[i] = args[i];
+    }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_custom_op_4d(
+        struct ggml_context         * ctx,
+        enum ggml_type                type,
+        int64_t                       ne0,
+        int64_t                       ne1,
+        int64_t                       ne2,
+        int64_t                       ne3,
+        struct ggml_tensor         ** args,
+        int                           n_args,
+        const struct ggml_custom_op * op,
+        const void                  * params,
+        size_t                        params_size,
+        struct ggml_custom_sched      sched) {
+
+    GGML_ASSERT(n_args < GGML_MAX_SRC);
+    GGML_ASSERT(op != NULL && op->fun != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, ne0, ne1, ne2, ne3);
+
+    // the params live as long as the node
+    void * params_copy = NULL;
+    if (params_size > 0) {
+        params_copy = ggml_new_buffer(ctx, params_size);
+        memcpy(params_copy, params, params_size);
+    }
+
+    struct ggml_custom_op_params p;
+    memset(&p, 0, sizeof(p));
+    p.fun         = op->fun;
+    p.n_tasks     = sched.n_tasks;
+    p.userdata    = params_copy;
+    p.op          = op;
+    p.params_size = (uint32_t) params_size;
+    for (int i = 0; i < 3; i++) {
+        p.n_groups[i]   = sched.n_groups[i]   > 0 ? sched.n_groups[i]   : 1;
+        p.group_size[i] = sched.group_size[i] > 0 ? sched.group_size[i] : 1;
+    }
+    ggml_set_op_params(result, &p, sizeof(p));
 
     result->op = GGML_OP_CUSTOM;
     for (int i = 0; i < n_args; i++) {
@@ -6187,9 +6238,13 @@ struct ggml_tensor * ggml_custom_inplace(
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 
     struct ggml_custom_op_params params = {
-        /*.fun      =*/ fun,
-        /*.n_tasks  =*/ n_tasks,
-        /*.userdata =*/ userdata
+        /*.fun         =*/ fun,
+        /*.n_tasks     =*/ n_tasks,
+        /*.userdata    =*/ userdata,
+        /*.op          =*/ NULL,
+        /*.params_size =*/ 0,
+        /*.n_groups    =*/ { 0 },
+        /*.group_size  =*/ { 0 },
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
