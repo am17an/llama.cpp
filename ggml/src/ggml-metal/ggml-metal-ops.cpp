@@ -843,7 +843,10 @@ int ggml_metal_op_custom(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), 2 + i);
     }
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, p.n_groups[0], p.n_groups[1], p.n_groups[2], p.group_size[0], p.group_size[1], p.group_size[2]);
+    // the kernel tells its threadgroups
+    const struct ggml_custom_sched sched = ggml_custom_op_sched(op, ggml_custom_op_kernel(op, GGML_METAL_NAME));
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, sched.n_groups[0], sched.n_groups[1], sched.n_groups[2], sched.group_size[0], sched.group_size[1], sched.group_size[2]);
 
     return 1;
 }

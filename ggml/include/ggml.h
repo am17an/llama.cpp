@@ -2610,35 +2610,40 @@ extern "C" {
 
     // Custom operators that other backends than the CPU can run
     //
-    // The CPU backend calls fun(dst, ith, nth, params), like ggml_custom_4d().
-    // A backend with a kernel in the list runs the node itself, with n_groups workgroups of group_size threads.
-    // The kernel gets the data of the node, the data of its arguments and the params of the node:
+    // An op is a list of kernels, one for each backend that can run it, by the name of the backend (ggml_backend_reg_name()).
+    // A backend runs its kernel with the data of the node, the data of its arguments and the params of the node:
     //
-    //   backend  code                kernel
-    //   "CUDA"   PTX (nvcc -ptx)     extern "C" __global__ void name(T * dst, const T0 * a0, ..., const P params)
-    //   "MTL"    Metal source        kernel void name(constant P & params, device T * dst, device const T0 * a0, ...)
+    //   backend  kernel
+    //   "CPU"    fun(dst, ith, nth, params), like ggml_custom_4d()
+    //   "CUDA"   code: PTX (nvcc -ptx)   extern "C" __global__ void name(T * dst, const T0 * a0, ..., const P params)
+    //   "MTL"    code: Metal source      kernel void name(constant P & params, device T * dst, device const T0 * a0, ...)
     //
-    // The backend names are those of ggml_backend_reg_name().
-    // The CPU backend also computes the node if the backend has no kernel, cannot load it, or the tensors are not contiguous.
+    // The op needs the CPU kernel: the CPU also computes the node if the backend has no kernel, cannot load it, or the tensors are not contiguous.
+
+    // how a kernel runs a node
+    struct ggml_custom_sched {
+        int n_tasks;       // CPU: number of threads, GGML_N_TASKS_MAX to use them all
+        int n_groups[3];   // other backends: number of workgroups
+        int group_size[3]; // other backends: threads of a workgroup
+    };
+
+    // each kernel tells how it runs a node, from the node, its arguments (node->src) and its params
+    // the backend calls it, the result must depend on the shapes and the params only
+    typedef void (*ggml_custom_sched_t)(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched);
 
     struct ggml_custom_kernel {
-        const char * backend;
-        const void * code;
-        size_t       code_size; // 0: code is a string
-        const char * name;      // name of the kernel in the code
+        const char *        backend;
+        ggml_custom_sched_t sched;     // NULL: 1 thread, 1 workgroup of 1 thread
+        ggml_custom_op_t    fun;       // CPU
+        const void *        code;      // other backends
+        size_t              code_size; // 0: code is a string
+        const char *        name;      // name of the kernel in the code
     };
 
     struct ggml_custom_op {
         const char                      * name;
-        ggml_custom_op_t                  fun; // CPU
         const struct ggml_custom_kernel * kernels;
         int                               n_kernels;
-    };
-
-    struct ggml_custom_sched {
-        int n_tasks;       // CPU: number of threads, GGML_N_TASKS_MAX to use them all
-        int n_groups[3];   // kernels: number of workgroups
-        int group_size[3]; // kernels: threads of a workgroup
     };
 
     // op and what it points to must outlive the graph, params is copied
@@ -2653,8 +2658,7 @@ extern "C" {
             int                           n_args,
             const struct ggml_custom_op * op,
             const void                  * params,
-            size_t                        params_size,
-            struct ggml_custom_sched      sched);
+            size_t                        params_size);
 
     // Busy-wait operator for scheduling and backend testing.
     GGML_API struct ggml_tensor * ggml_sleep(

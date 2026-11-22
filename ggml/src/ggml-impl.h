@@ -212,12 +212,16 @@ struct ggml_custom_op_params {
     int              n_tasks;
     void           * userdata;
 
-    // ggml_custom_op_4d(): the op with its kernels, userdata is the copy of the params, NULL for the other custom ops
+    // ggml_custom_op_4d(): the op with its kernels, fun is the CPU kernel and userdata the copy of the params, NULL for the other custom ops
     const struct ggml_custom_op * op;
     uint32_t params_size;
-    uint32_t n_groups[3];
-    uint32_t group_size[3];
 };
+
+// the kernel that a node of ggml_custom_op_4d() has for the backend (ggml_backend_reg_name()), NULL if it has none
+GGML_API const struct ggml_custom_kernel * ggml_custom_op_kernel(const struct ggml_tensor * node, const char * backend);
+
+// how the kernel runs the node, see ggml_custom_sched_t
+GGML_API struct ggml_custom_sched ggml_custom_op_sched(const struct ggml_tensor * node, const struct ggml_custom_kernel * kernel);
 
 // bitset
 

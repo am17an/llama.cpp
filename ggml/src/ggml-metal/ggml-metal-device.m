@@ -1574,19 +1574,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_device_get_pipeline_custom(ggm
         /*.cnt      =*/ false,
     };
 
-    struct ggml_custom_op_params p;
-    memcpy(&p, op->op_params, sizeof(p));
-    if (op->op != GGML_OP_CUSTOM || p.op == NULL) {
-        return res;
-    }
-
-    const struct ggml_custom_kernel * k = NULL;
-    for (int i = 0; i < p.op->n_kernels && k == NULL; ++i) {
-        if (strcmp(p.op->kernels[i].backend, GGML_METAL_NAME) == 0 && p.op->kernels[i].code != NULL && p.op->kernels[i].name != NULL) {
-            k = &p.op->kernels[i];
-        }
-    }
-    if (k == NULL) {
+    const struct ggml_custom_kernel * k = ggml_custom_op_kernel(op, GGML_METAL_NAME);
+    if (k == NULL || k->code == NULL || k->name == NULL) {
         return res;
     }
 

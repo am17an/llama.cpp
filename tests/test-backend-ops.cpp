@@ -3813,6 +3813,25 @@ static void test_custom_op_cpu(ggml_tensor * dst, int ith, int nth, void * userd
     }
 }
 
+// each kernel tells how it runs a node: the CPU on all the threads, Metal and CUDA with one thread for each element
+static void test_custom_op_sched_cpu(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(node);
+    GGML_UNUSED(params);
+    sched->n_tasks = GGML_N_TASKS_MAX;
+}
+
+static void test_custom_op_sched_metal(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    sched->group_size[0] = 32;
+    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 31)/32);
+}
+
+static void test_custom_op_sched_cuda(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    sched->group_size[0] = 256;
+    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 255)/256);
+}
+
 static const ggml_custom_op * test_custom_op_get() {
     static const char * metal = R"(
 #include <metal_stdlib>
@@ -3847,13 +3866,16 @@ kernel void test_custom_op(
 #endif
 
     static std::vector<ggml_custom_kernel> kernels;
-    kernels = { { "MTL", metal, 0, "test_custom_op" } };
+    kernels = {
+        { "CPU", test_custom_op_sched_cpu,   test_custom_op_cpu, nullptr, 0, nullptr },
+        { "MTL", test_custom_op_sched_metal, nullptr,            metal,   0, "test_custom_op" },
+    };
     if (!ptx.empty()) {
-        kernels.push_back({ "CUDA", ptx.c_str(), 0, "test_custom_op" });
+        kernels.push_back({ "CUDA", test_custom_op_sched_cuda, nullptr, ptx.c_str(), 0, "test_custom_op" });
     }
 
     static ggml_custom_op op;
-    op = { "test_custom_op", test_custom_op_cpu, kernels.data(), (int) kernels.size() };
+    op = { "test_custom_op", kernels.data(), (int) kernels.size() };
     return &op;
 }
 
@@ -3879,12 +3901,7 @@ struct test_custom_op : public test_case {
 
         ggml_tensor * args[] = { x, y };
         const test_custom_op_params p = { a, (int32_t) n };
-        const ggml_custom_sched sched = {
-            /*.n_tasks    =*/ GGML_N_TASKS_MAX,
-            /*.n_groups   =*/ { (int) ((n + 255)/256), 1, 1 },
-            /*.group_size =*/ { 256, 1, 1 },
-        };
-        ggml_tensor * out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p), sched);
+        ggml_tensor * out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p));
         ggml_set_name(out, "out");
 
         return out;

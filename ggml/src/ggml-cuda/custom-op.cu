@@ -19,18 +19,10 @@ static ggml_custom_op_params ggml_cuda_custom_op_params(const ggml_tensor * op) 
     return p;
 }
 
-// the kernel of the op for this backend, nullptr if it has none
-static const ggml_custom_kernel * ggml_cuda_custom_kernel(const ggml_custom_op_params & p) {
-    if (p.op == nullptr) {
-        return nullptr;
-    }
-    for (int i = 0; i < p.op->n_kernels; ++i) {
-        const ggml_custom_kernel & k = p.op->kernels[i];
-        if (strcmp(k.backend, GGML_CUDA_NAME) == 0 && k.code != nullptr && k.name != nullptr) {
-            return &k;
-        }
-    }
-    return nullptr;
+// the kernel that the node has for this backend, nullptr if it has none
+static const ggml_custom_kernel * ggml_cuda_custom_kernel(const ggml_tensor * op) {
+    const ggml_custom_kernel * k = ggml_custom_op_kernel(op, GGML_CUDA_NAME);
+    return k != nullptr && k->code != nullptr && k->name != nullptr ? k : nullptr;
 }
 
 // the kernel on the device, nullptr if the module or the kernel cannot be loaded
@@ -99,7 +91,7 @@ static bool ggml_cuda_custom_function_matches(CUfunction fun, const ggml_tensor 
 bool ggml_cuda_custom_op_supported(int device, const ggml_tensor * op) {
 #ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
     const ggml_custom_op_params p = ggml_cuda_custom_op_params(op);
-    const ggml_custom_kernel * k = ggml_cuda_custom_kernel(p);
+    const ggml_custom_kernel * k = ggml_cuda_custom_kernel(op);
     if (k == nullptr || !ggml_is_contiguous(op)) {
         return false;
     }
@@ -143,8 +135,12 @@ void ggml_cuda_custom_op_graph_props(ggml_tensor * node) {
 void ggml_cuda_op_custom(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
     const ggml_custom_op_params p = ggml_cuda_custom_op_params(dst);
-    const CUfunction fun = ggml_cuda_custom_function(ctx.device, *ggml_cuda_custom_kernel(p));
+    const ggml_custom_kernel * k = ggml_cuda_custom_kernel(dst);
+    const CUfunction fun = ggml_cuda_custom_function(ctx.device, *k);
     GGML_ASSERT(fun != nullptr);
+
+    // the kernel tells its grid and its blocks
+    const ggml_custom_sched sched = ggml_custom_op_sched(dst, k);
 
     void * args[GGML_MAX_SRC + 2];
     int n_args = 0;
@@ -156,7 +152,7 @@ void ggml_cuda_op_custom(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         args[n_args++] = p.userdata;
     }
 
-    CU_CHECK(cuLaunchKernel(fun, p.n_groups[0], p.n_groups[1], p.n_groups[2], p.group_size[0], p.group_size[1], p.group_size[2],
+    CU_CHECK(cuLaunchKernel(fun, sched.n_groups[0], sched.n_groups[1], sched.n_groups[2], sched.group_size[0], sched.group_size[1], sched.group_size[2],
         0, (CUstream) ctx.stream(), args, nullptr));
 #else
     GGML_UNUSED_VARS(ctx, dst); // not reached, see ggml_cuda_custom_op_supported

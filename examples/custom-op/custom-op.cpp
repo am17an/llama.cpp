@@ -1,6 +1,7 @@
 // A custom operator with implementations for several backends: saxpy, dst = a*x + y
 //
-// The op is a CPU function plus one kernel for each backend that can run it (see ggml_custom_op in ggml.h).
+// The op is a list of kernels, one for each backend that can run it (see ggml_custom_op in ggml.h).
+// Each kernel also tells how it runs a node: its threads or its workgroups.
 // A backend without a kernel leaves the node to the CPU backend.
 
 #include "ggml.h"
@@ -31,6 +32,13 @@ static void saxpy_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdat
     }
 }
 
+// CPU: on all the threads
+static void saxpy_cpu_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
+    (void) node;
+    (void) params;
+    sched->n_tasks = GGML_N_TASKS_MAX;
+}
+
 // Metal: the source of the kernel
 static const char * saxpy_metal = R"(
 #include <metal_stdlib>
@@ -52,6 +60,20 @@ kernel void saxpy(
     }
 }
 )";
+
+// Metal: threadgroups of 32 threads, one thread for each element
+static void saxpy_metal_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
+    (void) params;
+    sched->group_size[0] = 32;
+    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 31)/32);
+}
+
+// CUDA: blocks of 256 threads, one thread for each element
+static void saxpy_cuda_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
+    (void) params;
+    sched->group_size[0] = 256;
+    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 255)/256);
+}
 
 // CUDA: custom-op.cu, compiled to PTX
 static std::string saxpy_cuda() {
@@ -88,15 +110,10 @@ static std::vector<float> compute(ggml_backend_t backend, const struct ggml_cust
     struct ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
     struct ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
 
-    // the node: its arguments, its params and how to run it
+    // the node: its arguments and its params
     struct ggml_tensor * args[2] = { x, y };
     const saxpy_params p = { 2.0f, n };
-    struct ggml_custom_sched how = {
-        /*.n_tasks    =*/ GGML_N_TASKS_MAX,
-        /*.n_groups   =*/ { (n + 3)/4, 1, 1 },
-        /*.group_size =*/ { 4, 1, 1 },
-    };
-    struct ggml_tensor * result = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p), how);
+    struct ggml_tensor * result = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p));
 
     ggml_build_forward_expand(gf, result);
 
@@ -126,15 +143,16 @@ static std::vector<float> compute(ggml_backend_t backend, const struct ggml_cust
 int main(void) {
     ggml_backend_load_all();
 
-    // the op: the CPU function and the kernels, by the name of the backend (see ggml_backend_reg_name)
+    // the op: its kernels, by the name of the backend (see ggml_backend_reg_name)
     const std::string ptx = saxpy_cuda();
     std::vector<struct ggml_custom_kernel> kernels = {
-        { "MTL", saxpy_metal, 0, "saxpy" },
+        { "CPU", saxpy_cpu_sched,   saxpy_cpu, nullptr,     0, nullptr },
+        { "MTL", saxpy_metal_sched, nullptr,   saxpy_metal, 0, "saxpy" },
     };
     if (!ptx.empty()) {
-        kernels.push_back({ "CUDA", ptx.c_str(), 0, "saxpy" });
+        kernels.push_back({ "CUDA", saxpy_cuda_sched, nullptr, ptx.c_str(), 0, "saxpy" });
     }
-    const struct ggml_custom_op op = { "saxpy", saxpy_cpu, kernels.data(), (int) kernels.size() };
+    const struct ggml_custom_op op = { "saxpy", kernels.data(), (int) kernels.size() };
 
     // expected result:
     // [ 12.00 24.00 36.00 48.00 60.00 72.00 84.00 96.00 ]
