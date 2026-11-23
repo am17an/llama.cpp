@@ -381,6 +381,21 @@ if (GGML_CUDA)
     target_compile_definitions(test-backend-ops PRIVATE TEST_CUSTOM_OP_PTX="${TEST_CUSTOM_OP_PTX}")
 endif()
 
+# the Vulkan kernel of test_custom_op is compiled to SPIR-V, the test loads the file
+if (GGML_VULKAN)
+    find_package(Vulkan COMPONENTS glslc REQUIRED)
+    set(TEST_CUSTOM_OP_SPV ${CMAKE_CURRENT_BINARY_DIR}/test-backend-ops-custom.spv)
+    add_custom_command(
+        OUTPUT  ${TEST_CUSTOM_OP_SPV}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -fshader-stage=compute --target-env=vulkan1.2 -o ${TEST_CUSTOM_OP_SPV} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-ops-custom.comp
+        DEPENDS test-backend-ops-custom.comp
+        VERBATIM
+    )
+    add_custom_target(test-backend-ops-spv DEPENDS ${TEST_CUSTOM_OP_SPV})
+    add_dependencies(test-backend-ops test-backend-ops-spv)
+    target_compile_definitions(test-backend-ops PRIVATE TEST_CUSTOM_OP_SPV="${TEST_CUSTOM_OP_SPV}")
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)

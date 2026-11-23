@@ -3813,7 +3813,7 @@ static void test_custom_op_cpu(ggml_tensor * dst, int ith, int nth, void * userd
     }
 }
 
-// each kernel tells how it runs a node: the CPU on all the threads, Metal and CUDA with one thread for each element
+// each kernel tells how it runs a node: the CPU on all the threads, Metal, CUDA and Vulkan with one thread for each element
 static void test_custom_op_sched_cpu(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
     GGML_UNUSED(node);
     GGML_UNUSED(params);
@@ -3830,6 +3830,12 @@ static void test_custom_op_sched_cuda(const ggml_tensor * node, const void * par
     GGML_UNUSED(params);
     ggml_custom_sched_set_group_size(sched, 256, 1, 1);
     ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 255)/256), 1, 1);
+}
+
+static void test_custom_op_sched_vulkan(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    ggml_custom_sched_set_group_size(sched, 64, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 63)/64), 1, 1);
 }
 
 // the op lives as long as the test
@@ -3876,6 +3882,21 @@ kernel void test_custom_op(
             ggml_custom_kernel * k_cuda = ggml_custom_op_add_kernel(op, "CUDA");
             ggml_custom_kernel_set_code (k_cuda, ptx.c_str(), 0, "test_custom_op");
             ggml_custom_kernel_set_sched(k_cuda, test_custom_op_sched_cuda);
+        }
+    }
+#endif
+
+    // test-backend-ops-custom.comp compiled to SPIR-V
+#ifdef TEST_CUSTOM_OP_SPV
+    {
+        std::ifstream file(TEST_CUSTOM_OP_SPV, std::ios::binary);
+        std::stringstream ss;
+        ss << file.rdbuf();
+        const std::string spv = ss.str();
+        if (!spv.empty()) {
+            ggml_custom_kernel * k_vulkan = ggml_custom_op_add_kernel(op, "Vulkan");
+            ggml_custom_kernel_set_code (k_vulkan, spv.data(), spv.size(), "main");
+            ggml_custom_kernel_set_sched(k_vulkan, test_custom_op_sched_vulkan);
         }
     }
 #endif

@@ -75,16 +75,27 @@ static void saxpy_cuda_sched(const struct ggml_tensor * node, const void * param
     ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 255)/256), 1, 1);
 }
 
-// CUDA: custom-op.cu, compiled to PTX
-static std::string saxpy_cuda() {
-#ifdef CUSTOM_OP_PTX
-    std::ifstream file(CUSTOM_OP_PTX);
-    std::stringstream ptx;
-    ptx << file.rdbuf();
-    return ptx.str();
-#else
-    return "";
+// Vulkan: workgroups of 64 threads, one thread for each element
+static void saxpy_vulkan_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
+    (void) params;
+    ggml_custom_sched_set_group_size(sched, 64, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 63)/64), 1, 1);
+}
+
+// the code that CMake compiles: custom-op.cu to PTX for CUDA, custom-op.comp to SPIR-V for Vulkan
+#ifndef CUSTOM_OP_PTX
+#define CUSTOM_OP_PTX ""
 #endif
+#ifndef CUSTOM_OP_SPV
+#define CUSTOM_OP_SPV ""
+#endif
+
+// empty without the file
+static std::string saxpy_code(const char * path) {
+    std::ifstream file(path, std::ios::binary);
+    std::stringstream code;
+    code << file.rdbuf();
+    return code.str();
 }
 
 static const int n = 8;
@@ -154,11 +165,19 @@ int main(void) {
     ggml_custom_kernel_set_code (metal, saxpy_metal, 0, "saxpy");
     ggml_custom_kernel_set_sched(metal, saxpy_metal_sched);
 
-    const std::string ptx = saxpy_cuda();
+    const std::string ptx = saxpy_code(CUSTOM_OP_PTX);
     if (!ptx.empty()) {
         struct ggml_custom_kernel * cuda = ggml_custom_op_add_kernel(op, "CUDA");
         ggml_custom_kernel_set_code (cuda, ptx.c_str(), 0, "saxpy");
         ggml_custom_kernel_set_sched(cuda, saxpy_cuda_sched);
+    }
+
+    // SPIR-V is binary: the code with its size. The name is the entry point of the shader
+    const std::string spv = saxpy_code(CUSTOM_OP_SPV);
+    if (!spv.empty()) {
+        struct ggml_custom_kernel * vulkan = ggml_custom_op_add_kernel(op, "Vulkan");
+        ggml_custom_kernel_set_code (vulkan, spv.data(), spv.size(), "main");
+        ggml_custom_kernel_set_sched(vulkan, saxpy_vulkan_sched);
     }
 
     // expected result:

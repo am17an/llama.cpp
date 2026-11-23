@@ -2617,6 +2617,8 @@ extern "C" {
     //   "CPU"    fun(dst, ith, nth, params), like ggml_custom_4d()
     //   "CUDA"   code: PTX (nvcc -ptx)   extern "C" __global__ void name(T * dst, const T0 * a0, ..., const P params)
     //   "MTL"    code: Metal source      kernel void name(constant P & params, device T * dst, device const T0 * a0, ...)
+    //   "Vulkan" code: SPIR-V (glslc)    compute shader with the entry point name: the buffers dst, a0, ... at the bindings 0, 1, ...,
+    //                                    the push constants P params, the size of a workgroup in the specialization constants 0, 1, 2
     //
     // The op needs the CPU kernel: the CPU also computes the node if the backend has no kernel, cannot load it, or the tensors are not contiguous.
 

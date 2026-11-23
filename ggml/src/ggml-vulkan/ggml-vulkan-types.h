@@ -1050,6 +1050,12 @@ struct vk_device_struct {
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
 
+    // pipelines of the custom op kernels of the user, see ggml-vulkan-custom-op.cpp (guarded by mutex)
+    // by uid of the kernel code and size of workgroup, nullptr: cannot be made
+    std::map<std::pair<uint64_t, std::array<uint32_t, 3>>, vk_pipeline> pipeline_custom;
+    // by code, entry point and size of workgroup
+    std::map<std::tuple<std::string, std::string, std::array<uint32_t, 3>>, vk_pipeline> pipeline_custom_code;
+
     std::vector<vk_pipeline_ref> all_pipelines;
 
     vk::Fence fence;

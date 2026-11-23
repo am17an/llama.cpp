@@ -72,6 +72,7 @@ if (Vulkan_FOUND)
                              ggml-vulkan-common.h
                              ggml-vulkan-buffers.cpp
                              ggml-vulkan-comm.cpp
+                             ggml-vulkan-custom-op.cpp
                              ggml-vulkan-debug.cpp
                             )
 
