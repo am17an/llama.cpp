@@ -921,10 +921,10 @@ struct ggml_metal_device {
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 
-    // the libraries of the custom op kernels (see ggml_custom_op in ggml.h), one per source, NULL if it does not compile
+    // the libraries of the custom op kernels (see ggml_custom_op_init in ggml.h), one per source, NULL if it does not compile
     int n_custom;
     struct {
-        const void *         code;
+        char *               code;
         ggml_metal_library_t lib;
     } custom[GGML_METAL_MAX_CUSTOM_LIBS];
 };
@@ -1393,6 +1393,7 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
 
         for (int i = 0; i < dev->n_custom; ++i) {
             ggml_metal_library_free(dev->custom[i].lib);
+            free(dev->custom[i].code);
         }
         dev->n_custom = 0;
 
@@ -1587,11 +1588,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_device_get_pipeline_custom(ggm
     ggml_metal_library_t lib = NULL;
     [lock lock];
     int i = 0;
-    while (i < dev->n_custom && dev->custom[i].code != k->code) {
+    while (i < dev->n_custom && strcmp(dev->custom[i].code, (const char *) k->code) != 0) {
         i++;
     }
     if (i == dev->n_custom && dev->n_custom < GGML_METAL_MAX_CUSTOM_LIBS) {
-        dev->custom[i].code = k->code;
+        dev->custom[i].code = strdup((const char *) k->code);
         dev->custom[i].lib  = ggml_metal_library_init_from_source(dev, (const char *) k->code, true);
         dev->n_custom++;
     }

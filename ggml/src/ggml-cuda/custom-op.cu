@@ -5,7 +5,7 @@
 #include <map>
 #include <mutex>
 #include <string>
-#include <tuple>
+#include <utility>
 
 // the modules are loaded with the driver API, as linked for the VMM pool
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
@@ -28,16 +28,17 @@ static const ggml_custom_kernel * ggml_cuda_custom_kernel(const ggml_tensor * op
 // the kernel on the device, nullptr if the module or the kernel cannot be loaded
 static CUfunction ggml_cuda_custom_function(int device, const ggml_custom_kernel & k) {
     static std::mutex mutex;
-    static std::map<std::pair<int, const void *>, CUmodule> modules;
-    static std::map<std::tuple<int, const void *, std::string>, CUfunction> functions;
+    static std::map<std::pair<int, uint64_t>, CUfunction> functions;
+    static std::map<std::pair<int, std::string>, CUmodule> modules;
 
     std::lock_guard<std::mutex> lock(mutex);
-    const auto key = std::make_tuple(device, k.code, std::string(k.name));
+    const auto key = std::make_pair(device, k.uid);
     if (const auto it = functions.find(key); it != functions.end()) {
         return it->second;
     }
 
-    const auto [it, is_new] = modules.try_emplace({ device, k.code }, nullptr);
+    // the kernels with the same code share its module
+    const auto [it, is_new] = modules.try_emplace({ device, std::string((const char *) k.code, k.code_size) }, nullptr);
     if (is_new) {
         ggml_cuda_set_device(device);
         // the driver API loads the module into the current context: make it the one of the runtime
@@ -121,12 +122,18 @@ void ggml_cuda_custom_op_graph_props(ggml_tensor * node) {
     }
     ggml_custom_op_params p;
     memcpy(&p, node->op_params, sizeof(p));
-    if (p.op == nullptr || p.params_size == 0) {
+    if (p.op == nullptr) {
         return;
     }
     uint64_t hash = 0xcbf29ce484222325ull; // FNV-1a
-    for (uint32_t i = 0; i < p.params_size; ++i) {
-        hash = (hash ^ ((const uint8_t *) p.userdata)[i])*0x100000001b3ull;
+    const auto add = [&hash](const void * data, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            hash = (hash ^ ((const uint8_t *) data)[i])*0x100000001b3ull;
+        }
+    };
+    add(p.userdata, p.params_size);
+    if (const ggml_custom_kernel * k = ggml_custom_op_kernel(node, GGML_CUDA_NAME); k != nullptr) {
+        add(&k->uid, sizeof(k->uid));
     }
     p.userdata = (void *) (uintptr_t) hash;
     memcpy(node->op_params, &p, sizeof(p));

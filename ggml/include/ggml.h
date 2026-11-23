@@ -2620,33 +2620,39 @@ extern "C" {
     //
     // The op needs the CPU kernel: the CPU also computes the node if the backend has no kernel, cannot load it, or the tensors are not contiguous.
 
-    // how a kernel runs a node
-    struct ggml_custom_sched {
-        int n_tasks;       // CPU: number of threads, GGML_N_TASKS_MAX to use them all
-        int n_groups[3];   // other backends: number of workgroups
-        int group_size[3]; // other backends: threads of a workgroup
-    };
+    struct ggml_custom_op;     // the kernels of an op
+    struct ggml_custom_kernel; // the implementation of an op for a backend
+    struct ggml_custom_sched;  // how a kernel runs a node
 
-    // each kernel tells how it runs a node, from the node, its arguments (node->src) and its params
-    // the backend calls it, the result must depend on the shapes and the params only
+    GGML_API struct ggml_custom_op * ggml_custom_op_init(const char * name);
+    GGML_API void                    ggml_custom_op_free(struct ggml_custom_op * op);
+    GGML_API const char *            ggml_custom_op_name(const struct ggml_custom_op * op);
+
+    // Add the kernel of a backend, the op owns it. An op has one kernel for a backend
+    GGML_API struct ggml_custom_kernel * ggml_custom_op_add_kernel(struct ggml_custom_op * op, const char * backend);
+
+    // "CPU": the function
+    GGML_API void ggml_custom_kernel_set_fun(struct ggml_custom_kernel * kernel, ggml_custom_op_t fun);
+
+    // Other backends: the code and the name of the kernel in the code, both are copied
+    // code_size 0: the code is a string
+    GGML_API void ggml_custom_kernel_set_code(struct ggml_custom_kernel * kernel, const void * code, size_t code_size, const char * name);
+
+    // Each kernel tells how it runs a node, from the node, its arguments (node->src) and its params
+    // The backend calls it, the result must depend on the shapes and the params only
+    // Without it: 1 thread, 1 workgroup of 1 thread
     typedef void (*ggml_custom_sched_t)(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched);
 
-    struct ggml_custom_kernel {
-        const char *        backend;
-        ggml_custom_sched_t sched;     // NULL: 1 thread, 1 workgroup of 1 thread
-        ggml_custom_op_t    fun;       // CPU
-        const void *        code;      // other backends
-        size_t              code_size; // 0: code is a string
-        const char *        name;      // name of the kernel in the code
-    };
+    GGML_API void ggml_custom_kernel_set_sched(struct ggml_custom_kernel * kernel, ggml_custom_sched_t sched);
 
-    struct ggml_custom_op {
-        const char                      * name;
-        const struct ggml_custom_kernel * kernels;
-        int                               n_kernels;
-    };
+    // To call from ggml_custom_sched_t
+    // CPU: number of threads, GGML_N_TASKS_MAX to use them all
+    GGML_API void ggml_custom_sched_set_n_tasks(struct ggml_custom_sched * sched, int n_tasks);
+    // Other backends: number of workgroups and threads of a workgroup, in each dimension
+    GGML_API void ggml_custom_sched_set_n_groups  (struct ggml_custom_sched * sched, int n0, int n1, int n2);
+    GGML_API void ggml_custom_sched_set_group_size(struct ggml_custom_sched * sched, int n0, int n1, int n2);
 
-    // op and what it points to must outlive the graph, params is copied
+    // A node of the op: the kernels of the op are set before, the op must outlive the graph, params is copied
     GGML_API struct ggml_tensor * ggml_custom_op_4d(
             struct ggml_context         * ctx,
             enum ggml_type                type,

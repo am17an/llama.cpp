@@ -2,7 +2,7 @@
 
 A custom operator with implementations for several backends: `saxpy`, `dst = a*x + y`.
 
-The op is described once, with `struct ggml_custom_op` (see `ggml.h`): a list of kernels, one for each backend that can run it, by the name of the backend.
+The op is described once (see `ggml_custom_op_init()` in `ggml.h`): a list of kernels, one for each backend that can run it, by the name of the backend.
 
 - `CPU`: a function, as for `ggml_custom_4d()`
 - `CUDA`: PTX, here compiled from [custom-op.cu](custom-op.cu) with `nvcc -ptx`

@@ -1,6 +1,6 @@
 // A custom operator with implementations for several backends: saxpy, dst = a*x + y
 //
-// The op is a list of kernels, one for each backend that can run it (see ggml_custom_op in ggml.h).
+// The op is a list of kernels, one for each backend that can run it (see ggml_custom_op_init in ggml.h).
 // Each kernel also tells how it runs a node: its threads or its workgroups.
 // A backend without a kernel leaves the node to the CPU backend.
 
@@ -36,7 +36,7 @@ static void saxpy_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdat
 static void saxpy_cpu_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
     (void) node;
     (void) params;
-    sched->n_tasks = GGML_N_TASKS_MAX;
+    ggml_custom_sched_set_n_tasks(sched, GGML_N_TASKS_MAX);
 }
 
 // Metal: the source of the kernel
@@ -64,15 +64,15 @@ kernel void saxpy(
 // Metal: threadgroups of 32 threads, one thread for each element
 static void saxpy_metal_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
     (void) params;
-    sched->group_size[0] = 32;
-    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 31)/32);
+    ggml_custom_sched_set_group_size(sched, 32, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 31)/32), 1, 1);
 }
 
 // CUDA: blocks of 256 threads, one thread for each element
 static void saxpy_cuda_sched(const struct ggml_tensor * node, const void * params, struct ggml_custom_sched * sched) {
     (void) params;
-    sched->group_size[0] = 256;
-    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 255)/256);
+    ggml_custom_sched_set_group_size(sched, 256, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 255)/256), 1, 1);
 }
 
 // CUDA: custom-op.cu, compiled to PTX
@@ -124,7 +124,7 @@ static std::vector<float> compute(ggml_backend_t backend, const struct ggml_cust
 
     ggml_backend_sched_graph_compute(sched, gf);
 
-    printf("%s computed by %s:\n[", op->name, ggml_backend_name(ggml_backend_sched_get_tensor_backend(sched, result)));
+    printf("%s computed by %s:\n[", ggml_custom_op_name(op), ggml_backend_name(ggml_backend_sched_get_tensor_backend(sched, result)));
 
     std::vector<float> out(n);
     ggml_backend_tensor_get(result, out.data(), 0, ggml_nbytes(result));
@@ -144,27 +144,36 @@ int main(void) {
     ggml_backend_load_all();
 
     // the op: its kernels, by the name of the backend (see ggml_backend_reg_name)
+    struct ggml_custom_op * op = ggml_custom_op_init("saxpy");
+
+    struct ggml_custom_kernel * cpu = ggml_custom_op_add_kernel(op, "CPU");
+    ggml_custom_kernel_set_fun  (cpu, saxpy_cpu);
+    ggml_custom_kernel_set_sched(cpu, saxpy_cpu_sched);
+
+    struct ggml_custom_kernel * metal = ggml_custom_op_add_kernel(op, "MTL");
+    ggml_custom_kernel_set_code (metal, saxpy_metal, 0, "saxpy");
+    ggml_custom_kernel_set_sched(metal, saxpy_metal_sched);
+
     const std::string ptx = saxpy_cuda();
-    std::vector<struct ggml_custom_kernel> kernels = {
-        { "CPU", saxpy_cpu_sched,   saxpy_cpu, nullptr,     0, nullptr },
-        { "MTL", saxpy_metal_sched, nullptr,   saxpy_metal, 0, "saxpy" },
-    };
     if (!ptx.empty()) {
-        kernels.push_back({ "CUDA", saxpy_cuda_sched, nullptr, ptx.c_str(), 0, "saxpy" });
+        struct ggml_custom_kernel * cuda = ggml_custom_op_add_kernel(op, "CUDA");
+        ggml_custom_kernel_set_code (cuda, ptx.c_str(), 0, "saxpy");
+        ggml_custom_kernel_set_sched(cuda, saxpy_cuda_sched);
     }
-    const struct ggml_custom_op op = { "saxpy", kernels.data(), (int) kernels.size() };
 
     // expected result:
     // [ 12.00 24.00 36.00 48.00 60.00 72.00 84.00 96.00 ]
 
     // with the best backend, then with the CPU only
     ggml_backend_t backend = ggml_backend_init_best();
-    const std::vector<float> out_best = compute(backend, &op);
+    const std::vector<float> out_best = compute(backend, op);
     ggml_backend_free(backend);
 
     backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    const std::vector<float> out_cpu = compute(backend, &op);
+    const std::vector<float> out_cpu = compute(backend, op);
     ggml_backend_free(backend);
+
+    ggml_custom_op_free(op);
 
     if (out_best != out_cpu) {
         printf("the results differ\n");

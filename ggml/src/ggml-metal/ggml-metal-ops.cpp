@@ -822,7 +822,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// a kernel of the user (see ggml_custom_op in ggml.h): the params at index 0, the node at 1, its arguments from 2
+// a kernel of the user (see ggml_custom_op_init in ggml.h): the params at index 0, the node at 1, its arguments from 2
 int ggml_metal_op_custom(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 

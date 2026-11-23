@@ -3817,21 +3817,22 @@ static void test_custom_op_cpu(ggml_tensor * dst, int ith, int nth, void * userd
 static void test_custom_op_sched_cpu(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
     GGML_UNUSED(node);
     GGML_UNUSED(params);
-    sched->n_tasks = GGML_N_TASKS_MAX;
+    ggml_custom_sched_set_n_tasks(sched, GGML_N_TASKS_MAX);
 }
 
 static void test_custom_op_sched_metal(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
     GGML_UNUSED(params);
-    sched->group_size[0] = 32;
-    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 31)/32);
+    ggml_custom_sched_set_group_size(sched, 32, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 31)/32), 1, 1);
 }
 
 static void test_custom_op_sched_cuda(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
     GGML_UNUSED(params);
-    sched->group_size[0] = 256;
-    sched->n_groups[0]   = (int) ((ggml_nelements(node) + 255)/256);
+    ggml_custom_sched_set_group_size(sched, 256, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 255)/256), 1, 1);
 }
 
+// the op lives as long as the test
 static const ggml_custom_op * test_custom_op_get() {
     static const char * metal = R"(
 #include <metal_stdlib>
@@ -3854,29 +3855,32 @@ kernel void test_custom_op(
 }
 )";
 
+    ggml_custom_op * op = ggml_custom_op_init("test_custom_op");
+
+    ggml_custom_kernel * k_cpu = ggml_custom_op_add_kernel(op, "CPU");
+    ggml_custom_kernel_set_fun  (k_cpu, test_custom_op_cpu);
+    ggml_custom_kernel_set_sched(k_cpu, test_custom_op_sched_cpu);
+
+    ggml_custom_kernel * k_metal = ggml_custom_op_add_kernel(op, "MTL");
+    ggml_custom_kernel_set_code (k_metal, metal, 0, "test_custom_op");
+    ggml_custom_kernel_set_sched(k_metal, test_custom_op_sched_metal);
+
     // test-backend-ops-custom.cu compiled to PTX
-    static std::string ptx;
 #ifdef TEST_CUSTOM_OP_PTX
     {
         std::ifstream file(TEST_CUSTOM_OP_PTX);
         std::stringstream ss;
         ss << file.rdbuf();
-        ptx = ss.str();
+        const std::string ptx = ss.str();
+        if (!ptx.empty()) {
+            ggml_custom_kernel * k_cuda = ggml_custom_op_add_kernel(op, "CUDA");
+            ggml_custom_kernel_set_code (k_cuda, ptx.c_str(), 0, "test_custom_op");
+            ggml_custom_kernel_set_sched(k_cuda, test_custom_op_sched_cuda);
+        }
     }
 #endif
 
-    static std::vector<ggml_custom_kernel> kernels;
-    kernels = {
-        { "CPU", test_custom_op_sched_cpu,   test_custom_op_cpu, nullptr, 0, nullptr },
-        { "MTL", test_custom_op_sched_metal, nullptr,            metal,   0, "test_custom_op" },
-    };
-    if (!ptx.empty()) {
-        kernels.push_back({ "CUDA", test_custom_op_sched_cuda, nullptr, ptx.c_str(), 0, "test_custom_op" });
-    }
-
-    static ggml_custom_op op;
-    op = { "test_custom_op", kernels.data(), (int) kernels.size() };
-    return &op;
+    return op;
 }
 
 struct test_custom_op : public test_case {
