@@ -571,9 +571,9 @@ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::
     return true;
 }
 
-static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
-                                         uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
-                                         bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
+void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
+                                  uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
+                                  bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
     VK_LOG_DEBUG("ggml_vk_create_pipeline(" << device->name << ", " << pipeline->name << ", " << entrypoint << ", " << parameter_count <<
                  ", (" << wg_denoms[0] << "," << wg_denoms[1] << "," << wg_denoms[2] << "), specialization_constants, " <<
                  disable_robustness << ", " << require_full_subgroups << ", " << required_subgroup_size << ")");
@@ -13826,6 +13826,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_timestep_embedding(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_CUSTOM:
+        ggml_vk_custom_op(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_COL2IM_1D:
         ggml_vk_col2im_1d(ctx, compute_ctx, src0, node);
 
@@ -17140,6 +17144,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_CUSTOM:
+            return ggml_vk_custom_op_supported(device, op);
         case GGML_OP_CONV_2D_DW:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
                 && op->src[1]->type == GGML_TYPE_F32;

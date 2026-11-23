@@ -12,7 +12,6 @@
 #include <mutex>
 #include <string>
 
-#define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
 // number of Metal devices

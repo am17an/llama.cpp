@@ -346,6 +346,12 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
+// the name of the backend, ggml_backend_reg_name()
+#define GGML_METAL_NAME "MTL"
+
+// the pipeline of the kernel that a custom op has for Metal (see ggml_custom_op_init in ggml.h), no pipeline if it has none
+struct ggml_metal_pipeline_with_params ggml_metal_device_get_pipeline_custom(ggml_metal_device_t dev, const struct ggml_tensor * op);
+
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
 struct ggml_metal_fusion_info;

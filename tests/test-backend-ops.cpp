@@ -3795,6 +3795,144 @@ struct test_add_id : public test_case {
     }
 };
 
+// GGML_OP_CUSTOM with kernels for the backends (ggml_custom_op_4d): the kernel of the backend against the CPU function
+struct test_custom_op_params {
+    float   a;
+    int32_t n;
+};
+
+static void test_custom_op_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const test_custom_op_params * p = (const test_custom_op_params *) userdata;
+
+    const float * x = (const float *) dst->src[0]->data;
+    const float * y = (const float *) dst->src[1]->data;
+    float       * d = (float *) dst->data;
+
+    for (int64_t i = (int64_t) p->n*ith/nth; i < (int64_t) p->n*(ith + 1)/nth; i++) {
+        d[i] = p->a*x[i] + y[i];
+    }
+}
+
+// each kernel tells how it runs a node: the CPU on all the threads, Metal, CUDA and Vulkan with one thread for each element
+static void test_custom_op_sched_cpu(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(node);
+    GGML_UNUSED(params);
+    ggml_custom_sched_set_n_tasks(sched, GGML_N_TASKS_MAX);
+}
+
+static void test_custom_op_sched_metal(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    ggml_custom_sched_set_group_size(sched, 32, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 31)/32), 1, 1);
+}
+
+static void test_custom_op_sched_cuda(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    ggml_custom_sched_set_group_size(sched, 256, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 255)/256), 1, 1);
+}
+
+static void test_custom_op_sched_vulkan(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    GGML_UNUSED(params);
+    ggml_custom_sched_set_group_size(sched, 64, 1, 1);
+    ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 63)/64), 1, 1);
+}
+
+// the op lives as long as the test
+static const ggml_custom_op * test_custom_op_get() {
+    static const char * metal = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct test_custom_op_params {
+    float a;
+    int   n;
+};
+
+kernel void test_custom_op(
+        constant test_custom_op_params & p,
+        device       float * dst,
+        device const float * x,
+        device const float * y,
+        uint i [[thread_position_in_grid]]) {
+    if (i < (uint) p.n) {
+        dst[i] = p.a*x[i] + y[i];
+    }
+}
+)";
+
+    ggml_custom_op * op = ggml_custom_op_init("test_custom_op");
+
+    ggml_custom_kernel * k_cpu = ggml_custom_op_add_kernel(op, "CPU");
+    ggml_custom_kernel_set_fun  (k_cpu, test_custom_op_cpu);
+    ggml_custom_kernel_set_sched(k_cpu, test_custom_op_sched_cpu);
+
+    ggml_custom_kernel * k_metal = ggml_custom_op_add_kernel(op, "MTL");
+    ggml_custom_kernel_set_code (k_metal, metal, 0, "test_custom_op");
+    ggml_custom_kernel_set_sched(k_metal, test_custom_op_sched_metal);
+
+    // test-backend-ops-custom.cu compiled to PTX
+#ifdef TEST_CUSTOM_OP_PTX
+    {
+        std::ifstream file(TEST_CUSTOM_OP_PTX);
+        std::stringstream ss;
+        ss << file.rdbuf();
+        const std::string ptx = ss.str();
+        if (!ptx.empty()) {
+            ggml_custom_kernel * k_cuda = ggml_custom_op_add_kernel(op, "CUDA");
+            ggml_custom_kernel_set_code (k_cuda, ptx.c_str(), 0, "test_custom_op");
+            ggml_custom_kernel_set_sched(k_cuda, test_custom_op_sched_cuda);
+        }
+    }
+#endif
+
+    // test-backend-ops-custom.comp compiled to SPIR-V
+#ifdef TEST_CUSTOM_OP_SPV
+    {
+        std::ifstream file(TEST_CUSTOM_OP_SPV, std::ios::binary);
+        std::stringstream ss;
+        ss << file.rdbuf();
+        const std::string spv = ss.str();
+        if (!spv.empty()) {
+            ggml_custom_kernel * k_vulkan = ggml_custom_op_add_kernel(op, "Vulkan");
+            ggml_custom_kernel_set_code (k_vulkan, spv.data(), spv.size(), "main");
+            ggml_custom_kernel_set_sched(k_vulkan, test_custom_op_sched_vulkan);
+        }
+    }
+#endif
+
+    return op;
+}
+
+struct test_custom_op : public test_case {
+    const int64_t n;
+    const float a;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, a);
+    }
+
+    test_custom_op(int64_t n = 1000, float a = 2.0f)
+        : n(n), a(a) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        static const ggml_custom_op * op = test_custom_op_get();
+
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(y, "y");
+
+        ggml_tensor * args[] = { x, y };
+        const test_custom_op_params p = { a, (int32_t) n };
+        ggml_tensor * out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SCALE
 struct test_scale : public test_case {
     const ggml_type type;
@@ -11790,6 +11928,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {1, 2, 2, 2}, 7));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {2, 2, 2, 2}, 8));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+
+    for (int64_t n : { 1, 255, 1000, 100000 }) {
+        test_cases.emplace_back(new test_custom_op(n, 2.0f));
+    }
 
     test_cases.emplace_back(new test_scale());
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
