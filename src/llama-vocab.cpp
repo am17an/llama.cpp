@@ -3032,7 +3032,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 } else {
                     throw std::runtime_error(format("unknown metaspace prepend_scheme: '%s'", scheme.c_str()));
                 }
-                if (type == LLAMA_VOCAB_TYPE_BPE && metaspace_prepend_scheme == LLAMA_METASPACE_PREPEND_SCHEME_ALWAYS) {
+                // the mmbert pre-tokenizer implements the Metaspace prepend itself, which matches "always"
+                if (type == LLAMA_VOCAB_TYPE_BPE && metaspace_prepend_scheme == LLAMA_METASPACE_PREPEND_SCHEME_ALWAYS &&
+                    pre_type != LLAMA_VOCAB_PRE_TYPE_MMBERT) {
                     throw std::runtime_error("metaspace prepend_scheme 'always' is not supported for BPE vocab");
                 }
             }
