@@ -3838,8 +3838,28 @@ static void test_custom_op_sched_vulkan(const ggml_tensor * node, const void * p
     ggml_custom_sched_set_n_groups  (sched, (int) ((ggml_nelements(node) + 63)/64), 1, 1);
 }
 
-// the op lives as long as the test
-static const ggml_custom_op * test_custom_op_get() {
+// a kernel that also asks to run next to the nodes after it (ggml_custom_sched_set_async)
+template <ggml_custom_sched_t base>
+static void test_custom_op_sched_async(const ggml_tensor * node, const void * params, ggml_custom_sched * sched) {
+    base(node, params, sched);
+    ggml_custom_sched_set_async(sched, true);
+}
+
+// test-backend-ops-custom.cu compiled to PTX, empty without it
+static const std::string & test_custom_op_ptx() {
+    static const std::string ptx = [] {
+        std::stringstream ss;
+#ifdef TEST_CUSTOM_OP_PTX
+        std::ifstream file(TEST_CUSTOM_OP_PTX);
+        ss << file.rdbuf();
+#endif
+        return ss.str();
+    }();
+    return ptx;
+}
+
+// the op lives as long as the test. async: its kernels ask to run next to the nodes after them
+static const ggml_custom_op * test_custom_op_get(bool async = false) {
     static const char * metal = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -3861,30 +3881,21 @@ kernel void test_custom_op(
 }
 )";
 
-    ggml_custom_op * op = ggml_custom_op_init("test_custom_op");
+    ggml_custom_op * op = ggml_custom_op_init(async ? "test_custom_op_async" : "test_custom_op");
 
     ggml_custom_kernel * k_cpu = ggml_custom_op_add_kernel(op, "CPU");
     ggml_custom_kernel_set_fun  (k_cpu, test_custom_op_cpu);
-    ggml_custom_kernel_set_sched(k_cpu, test_custom_op_sched_cpu);
+    ggml_custom_kernel_set_sched(k_cpu, async ? test_custom_op_sched_async<test_custom_op_sched_cpu> : test_custom_op_sched_cpu);
 
     ggml_custom_kernel * k_metal = ggml_custom_op_add_kernel(op, "MTL");
     ggml_custom_kernel_set_code (k_metal, metal, 0, "test_custom_op");
-    ggml_custom_kernel_set_sched(k_metal, test_custom_op_sched_metal);
+    ggml_custom_kernel_set_sched(k_metal, async ? test_custom_op_sched_async<test_custom_op_sched_metal> : test_custom_op_sched_metal);
 
-    // test-backend-ops-custom.cu compiled to PTX
-#ifdef TEST_CUSTOM_OP_PTX
-    {
-        std::ifstream file(TEST_CUSTOM_OP_PTX);
-        std::stringstream ss;
-        ss << file.rdbuf();
-        const std::string ptx = ss.str();
-        if (!ptx.empty()) {
-            ggml_custom_kernel * k_cuda = ggml_custom_op_add_kernel(op, "CUDA");
-            ggml_custom_kernel_set_code (k_cuda, ptx.c_str(), 0, "test_custom_op");
-            ggml_custom_kernel_set_sched(k_cuda, test_custom_op_sched_cuda);
-        }
+    if (const std::string & ptx = test_custom_op_ptx(); !ptx.empty()) {
+        ggml_custom_kernel * k_cuda = ggml_custom_op_add_kernel(op, "CUDA");
+        ggml_custom_kernel_set_code (k_cuda, ptx.c_str(), 0, "test_custom_op");
+        ggml_custom_kernel_set_sched(k_cuda, async ? test_custom_op_sched_async<test_custom_op_sched_cuda> : test_custom_op_sched_cuda);
     }
-#endif
 
     // test-backend-ops-custom.comp compiled to SPIR-V
 #ifdef TEST_CUSTOM_OP_SPV
@@ -3896,7 +3907,7 @@ kernel void test_custom_op(
         if (!spv.empty()) {
             ggml_custom_kernel * k_vulkan = ggml_custom_op_add_kernel(op, "Vulkan");
             ggml_custom_kernel_set_code (k_vulkan, spv.data(), spv.size(), "main");
-            ggml_custom_kernel_set_sched(k_vulkan, test_custom_op_sched_vulkan);
+            ggml_custom_kernel_set_sched(k_vulkan, async ? test_custom_op_sched_async<test_custom_op_sched_vulkan> : test_custom_op_sched_vulkan);
         }
     }
 #endif
@@ -3927,6 +3938,59 @@ struct test_custom_op : public test_case {
         ggml_tensor * args[] = { x, y };
         const test_custom_op_params p = { a, (int32_t) n };
         ggml_tensor * out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op, &p, sizeof(p));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_CUSTOM with kernels that ask to run next to the nodes after them (ggml_custom_sched_set_async):
+// n_async nodes of the async op, the nodes in between, then the nodes that take the async nodes, one each
+// custom_taker: custom ops take them, so a backend can run the async nodes next to the nodes in between. Else ggml_add
+struct test_custom_op_async : public test_case {
+    const int64_t n;
+    const int n_async;
+    const bool custom_taker;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CUSTOM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, n_async, custom_taker);
+    }
+
+    test_custom_op_async(int64_t n = 1000, int n_async = 1, bool custom_taker = true)
+        : n(n), n_async(n_async), custom_taker(custom_taker) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        static const ggml_custom_op * op       = test_custom_op_get();
+        static const ggml_custom_op * op_async = test_custom_op_get(true);
+
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(y, "y");
+
+        // the nodes in between
+        ggml_tensor * out = ggml_scale(ctx, ggml_add(ctx, x, y), 0.5f);
+
+        // each taker has its async node as the first argument: the graph has all the async nodes, the nodes in between, then the takers
+        for (int i = 0; i < n_async; i++) {
+            ggml_tensor * args[] = { x, y };
+            const test_custom_op_params p = { 1.0f + i, (int32_t) n };
+            ggml_tensor * a = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args, 2, op_async, &p, sizeof(p));
+
+            if (custom_taker) {
+                ggml_tensor * args_taker[] = { a, out };
+                const test_custom_op_params p_taker = { 0.5f, (int32_t) n };
+                out = ggml_custom_op_4d(ctx, GGML_TYPE_F32, n, 1, 1, 1, args_taker, 2, op, &p_taker, sizeof(p_taker));
+            } else {
+                out = ggml_add(ctx, a, out);
+            }
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -11931,6 +11995,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int64_t n : { 1, 255, 1000, 100000 }) {
         test_cases.emplace_back(new test_custom_op(n, 2.0f));
+    }
+    // more async nodes at once than a backend has streams for them
+    for (int n_async : { 1, 2, 4 }) {
+        for (bool custom_taker : { true, false }) {
+            test_cases.emplace_back(new test_custom_op_async(1000, n_async, custom_taker));
+        }
     }
 
     test_cases.emplace_back(new test_scale());

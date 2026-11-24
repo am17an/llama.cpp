@@ -995,6 +995,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (cudaEvent_t event : custom_op_events) {
+        if (event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5424,8 +5429,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
-                // a concurrent region must join before its capture can end
-                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                // a concurrent region and the async custom ops must join before their capture can end
+                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active && !ggml_cuda_custom_op_async_open(*cuda_ctx)) {
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                     chunk_end = i + chunk_size;
@@ -5462,6 +5467,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+
+                // the stream of the node waits for the async custom ops that it takes
+                ggml_cuda_custom_op_join(*cuda_ctx, node);
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
@@ -5500,16 +5508,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // an async custom op runs on a side stream
+                const int stream_no = cuda_ctx->curr_stream_no;
+                if (!is_concurrent_event_active) {
+                    ggml_cuda_custom_op_fork(*cuda_ctx, cgraph, i);
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
 
+                cuda_ctx->curr_stream_no = stream_no;
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+            GGML_ASSERT(!ggml_cuda_custom_op_async_open(*cuda_ctx));
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -5668,6 +5685,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     };
+
+    // an async custom op runs until the node that takes it: keep its tensors allocated until then
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const int j = ggml_cuda_custom_op_async_until(cgraph, i);
+        if (j < 0) {
+            continue;
+        }
+        params->add_alloc_dep(params->user_data, cgraph->nodes[i], cgraph->nodes[j]);
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (cgraph->nodes[i]->src[k]) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[k], cgraph->nodes[j]);
+            }
+        }
+    }
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.

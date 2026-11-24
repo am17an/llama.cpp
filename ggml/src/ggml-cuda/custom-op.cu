@@ -2,6 +2,7 @@
 
 #include "ggml-cuda.h"
 
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -114,6 +115,97 @@ bool ggml_cuda_custom_op_supported(int device, const ggml_tensor * op) {
     GGML_UNUSED_VARS(device, op);
     return false;
 #endif // GGML_CUDA_CUSTOM_OP_AVAILABLE
+}
+
+int ggml_cuda_custom_op_async_until(const ggml_cgraph * cgraph, int i) {
+#ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_custom_kernel * k = ggml_cuda_custom_kernel(node);
+    if (k == nullptr || !ggml_custom_op_sched(node, k).async) {
+        return -1;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        for (int s = 0; s < GGML_MAX_SRC && cgraph->nodes[j]->src[s] != nullptr; ++s) {
+            if (cgraph->nodes[j]->src[s] == node) {
+                return ggml_cuda_custom_kernel(cgraph->nodes[j]) != nullptr ? j : -1;
+            }
+        }
+    }
+    return -1;
+#else
+    GGML_UNUSED_VARS(cgraph, i);
+    return -1;
+#endif // GGML_CUDA_CUSTOM_OP_AVAILABLE
+}
+
+#ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
+static cudaEvent_t ggml_cuda_custom_op_event(cudaEvent_t & event) {
+    if (event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    return event;
+}
+
+// side stream i of the async custom ops
+static int ggml_cuda_custom_op_side(int i) {
+    return GGML_CUDA_MAX_STREAMS - 1 - i;
+}
+#endif // GGML_CUDA_CUSTOM_OP_AVAILABLE
+
+void ggml_cuda_custom_op_fork(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+#ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
+    if (cgraph->nodes[i]->op != GGML_OP_CUSTOM || ggml_cuda_custom_op_async_until(cgraph, i) < 0) {
+        return;
+    }
+    for (int s = 0; s < (int) std::size(ctx.custom_op_async); ++s) {
+        if (ctx.custom_op_async[s] != nullptr) {
+            continue;
+        }
+        // the side stream goes on after the nodes before this one
+        const cudaStream_t main = ctx.stream();
+        const cudaStream_t side = ctx.stream(ctx.device, ggml_cuda_custom_op_side(s));
+        const cudaEvent_t  fork = ggml_cuda_custom_op_event(ctx.custom_op_events[0]);
+        CUDA_CHECK(cudaEventRecord(fork, main));
+        CUDA_CHECK(cudaStreamWaitEvent(side, fork, 0));
+        ctx.custom_op_async[s] = cgraph->nodes[i];
+        ctx.curr_stream_no     = ggml_cuda_custom_op_side(s);
+        return;
+    }
+    // no side stream is free: on the stream of the graph, as without the hint
+#else
+    GGML_UNUSED_VARS(ctx, cgraph, i);
+#endif // GGML_CUDA_CUSTOM_OP_AVAILABLE
+}
+
+void ggml_cuda_custom_op_join(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+#ifdef GGML_CUDA_CUSTOM_OP_AVAILABLE
+    for (int s = 0; s < (int) std::size(ctx.custom_op_async); ++s) {
+        if (ctx.custom_op_async[s] == nullptr) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j] != nullptr; ++j) {
+            if (node->src[j] != ctx.custom_op_async[s]) {
+                continue;
+            }
+            const cudaEvent_t join = ggml_cuda_custom_op_event(ctx.custom_op_events[1 + s]);
+            CUDA_CHECK(cudaEventRecord(join, ctx.stream(ctx.device, ggml_cuda_custom_op_side(s))));
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), join, 0));
+            ctx.custom_op_async[s] = nullptr;
+            break;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(ctx, node);
+#endif // GGML_CUDA_CUSTOM_OP_AVAILABLE
+}
+
+bool ggml_cuda_custom_op_async_open(const ggml_backend_cuda_context & ctx) {
+    for (const ggml_tensor * node : ctx.custom_op_async) {
+        if (node != nullptr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ggml_cuda_custom_op_graph_props(ggml_tensor * node) {
