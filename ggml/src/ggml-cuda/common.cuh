@@ -155,6 +155,13 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
+# if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+# define GGML_CUDA_RESTRICT
+# else
+# define GGML_CUDA_RESTRICT __restrict__
+# endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -861,8 +868,10 @@ static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v,
 //     Due to the strict aliasing rule the compiler can do incorrect optimizations if src and dst have different types.
 //     The function is intended for copies between registers and SRAM/VRAM to make the compiler emit the right instructions.
 //     If dst and src point at different address spaces then they are guaranteed to not be aliased.
+// With PDL the source may be written by the previous kernel, __restrict__ would let the compiler hoist the load
+//     above ggml_cuda_pdl_sync() as a read-only (non-coherent) load, see GGML_CUDA_RESTRICT.
 template <int nbytes, int alignment = 0>
-static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ dst, const void * __restrict__ src) {
+static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * GGML_CUDA_RESTRICT dst, const void * GGML_CUDA_RESTRICT src) {
     static_assert(
         nbytes <= ggml_cuda_get_max_cpy_bytes() || alignment == 0,
         "You are misusing the alignment parameter for ggml_cuda_memcpy_1. "
@@ -1572,13 +1581,6 @@ struct ggml_cuda_pdl_config {
 bool ggml_cuda_kernel_can_use_pdl(const void * kernel);
 
 #endif //defined(GGML_CUDA_USE_PDL)
-
-// PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
-# if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
-# define GGML_CUDA_RESTRICT
-# else
-# define GGML_CUDA_RESTRICT __restrict__
-# endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {

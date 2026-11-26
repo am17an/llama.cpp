@@ -45,7 +45,7 @@ using fattn_kernel_t = void (*)(
                             const int32_t s31,  const int64_t s32,  const int64_t s33);
 
 typedef float (*vec_dot_KQ_t)(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8 , const void * GGML_CUDA_RESTRICT Q_ds);
 
 template <typename T_src, typename T_dst>
 using fattn_load_tile_t = void (*)(
@@ -94,7 +94,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8 , const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const half2 * K_h2 = (const half2 *) K_c;
     GGML_UNUSED(Q_q8);
@@ -124,7 +124,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8 , const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const nv_bfloat162 * K_bf16 = (const nv_bfloat162 *) K_c;
     GGML_UNUSED(Q_q8);
@@ -155,7 +155,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const uint8_t * K_f8 = (const uint8_t *) K_c;
     GGML_UNUSED(Q_q8);
@@ -183,7 +183,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const block_q4_0 * K_q4_0 = (const block_q4_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -214,7 +214,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const block_q4_1 * K_q4_1 = (const block_q4_1 *) K_c;
     GGML_UNUSED(Q_v);
@@ -247,7 +247,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const block_q5_0 * K_q5_0 = (const block_q5_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -292,7 +292,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_0(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const block_q5_1 * K_q5_1 = (const block_q5_1 *) K_c;
     GGML_UNUSED(Q_v);
@@ -338,7 +338,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * GGML_CUDA_RESTRICT K_c, const void * GGML_CUDA_RESTRICT Q_v, const int * GGML_CUDA_RESTRICT Q_q8, const void * GGML_CUDA_RESTRICT Q_ds_v) {
 
     const block_q8_0 * K_q8_0 = (const block_q8_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -366,7 +366,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
 
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
-    const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
+    const float * GGML_CUDA_RESTRICT x, const float scale, int * GGML_CUDA_RESTRICT yq32, void * GGML_CUDA_RESTRICT yds) {
 
     float vals[sizeof(int)] = {0.0f};
 #pragma unroll
@@ -411,7 +411,7 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_f16(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     if constexpr (std::is_same_v<T, half>) {
         ggml_cuda_memcpy_1<ne*sizeof(half)>(dst, (const half *) vx + i0);
     } else if constexpr (std::is_same_v<T, float>) {
@@ -429,7 +429,7 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_bf16(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     static_assert(std::is_same_v<T, float>, "BF16 V dequantization only supports float output");
     static_assert(ne % 2 == 0, "bad ne");
     __align__(16) nv_bfloat162 tmp[ne/2];
@@ -442,7 +442,7 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     static_assert(ne == 2 || ne == 4, "bad ne");
     static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "unsupported type");
     ggml_fp8_e4m3_t tmp[ne];
@@ -455,7 +455,7 @@ static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restr
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q4_0(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
     const int64_t ib    =  i0          /  QK4_0;
@@ -500,7 +500,7 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q4_1(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
     const int64_t ib    =  i0          /  QK4_1;
@@ -541,7 +541,7 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_0(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
     const int64_t ib    =  i0          /  QK5_0;
@@ -592,7 +592,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_1(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     const block_q5_1 * x = (const block_q5_1 *) vx;
 
     const int64_t ib    =  i0          /  QK5_1;
@@ -643,7 +643,7 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q8_0(const void * GGML_CUDA_RESTRICT vx, void * GGML_CUDA_RESTRICT dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
     const int64_t ib  = i0 / QK8_0;
